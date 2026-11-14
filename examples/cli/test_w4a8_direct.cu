@@ -1,3 +1,4 @@
+#include "third_party/json.hpp"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -109,119 +110,169 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    bool is_safetensors = false;
+    uint64_t st_header_len = 0;
+    nlohmann::json st_hdr;
+    const uint8_t* st_base_data = nullptr;
+
     if (memcmp(data, "GGUF", 4) != 0) {
-        std::cerr << "Invalid GGUF magic" << std::endl;
-        return 1;
-    }
-
-    uint32_t version = *(const uint32_t*)(data + 4);
-    uint64_t tensor_count = *(const uint64_t*)(data + 8);
-    uint64_t kv_count = *(const uint64_t*)(data + 16);
-    std::cout << "GGUF Header: Version " << version << ", Tensors: " << tensor_count 
-              << ", KV pairs: " << kv_count << std::endl;
-
-    size_t pos = 24;
-    std::unordered_map<std::string, std::string> metadata;
-    uint64_t alignment = 32;
-
-    for (size_t i = 0; i < kv_count; ++i) {
-        uint64_t key_len = *(const uint64_t*)(data + pos);
-        pos += 8;
-        std::string key((const char*)(data + pos), key_len);
-        pos += key_len;
-        uint32_t val_type = *(const uint32_t*)(data + pos);
-        pos += 4;
-        if (val_type == 8) { // STRING
-            uint64_t slen = *(const uint64_t*)(data + pos);
-            pos += 8;
-            std::string s((const char*)(data + pos), slen);
-            pos += slen;
-            metadata[key] = s;
-        } else if (val_type == 4 || val_type == 5) { // UINT32 / INT32
-            uint32_t v = *(const uint32_t*)(data + pos);
-            pos += 4;
-            metadata[key] = std::to_string(v);
-        } else if (val_type == 10 || val_type == 11) { // UINT64 / INT64
-            uint64_t v = *(const uint64_t*)(data + pos);
-            pos += 8;
-            if (key == "general.alignment") alignment = v;
-            metadata[key] = std::to_string(v);
-        } else if (val_type == 7) { // BOOL
-            uint8_t v = *(const uint8_t*)(data + pos);
-            pos += 1;
-            metadata[key] = v ? "true" : "false";
-        } else if (val_type == 6) { // FLOAT32
-            float v = *(const float*)(data + pos);
-            pos += 4;
-            metadata[key] = std::to_string(v);
-        } else if (val_type == 9) { // ARRAY
-            uint32_t etype = *(const uint32_t*)(data + pos);
-            pos += 4;
-            uint64_t alen = *(const uint64_t*)(data + pos);
-            pos += 8;
-            for (size_t a = 0; a < alen; ++a) {
-                if (etype == 8) {
-                    uint64_t slen = *(const uint64_t*)(data + pos);
-                    pos += 8 + slen;
-                } else if (etype == 4 || etype == 5 || etype == 6) {
-                    pos += 4;
-                } else if (etype == 10 || etype == 11 || etype == 12) {
-                    pos += 8;
-                } else {
-                    pos += 1;
-                }
+        st_header_len = *(const uint64_t*)data;
+        if (st_header_len > 0 && st_header_len < file_size - 8) {
+            try {
+                std::string json_str((const char*)(data + 8), st_header_len);
+                st_hdr = nlohmann::json::parse(json_str);
+                st_base_data = data + 8 + st_header_len;
+                is_safetensors = true;
+                std::cout << "Detected Safetensors format! Header length: " << st_header_len << std::endl;
+            } catch (...) {
+                std::cerr << "Failed to parse Safetensors JSON header" << std::endl;
+                return 1;
             }
         } else {
-            pos += 4;
+            std::cerr << "Invalid magic (not GGUF and not valid Safetensors)" << std::endl;
+            return 1;
         }
     }
 
-    if (metadata.count("h3.quant.format")) {
-        std::cout << "  h3.quant.format: " << metadata["h3.quant.format"] << std::endl;
-    }
-
-    std::unordered_map<std::string, GGUFTensor> tensors;
-    for (size_t i = 0; i < tensor_count; ++i) {
-        uint64_t name_len = *(const uint64_t*)(data + pos);
-        pos += 8;
-        std::string name((const char*)(data + pos), name_len);
-        pos += name_len;
-        uint32_t n_dims = *(const uint32_t*)(data + pos);
-        pos += 4;
-        std::vector<uint64_t> dims(n_dims);
-        size_t n_elem = 1;
-        for (uint32_t d = 0; d < n_dims; ++d) {
-            dims[d] = *(const uint64_t*)(data + pos);
-            pos += 8;
-            n_elem *= dims[d];
-        }
-        uint32_t type = *(const uint32_t*)(data + pos);
-        pos += 4;
-        uint64_t offset = *(const uint64_t*)(data + pos);
-        pos += 8;
-
-        size_t bsize = n_elem;
-        if (type == 0) bsize *= 4; // F32
-        else if (type == 1 || type == 29) bsize *= 2; // F16 / BF16
-        else if (type == 16) bsize *= 1; // I8 / U8
-
-        tensors[name] = {name, dims, type, offset, bsize};
-    }
-
-    size_t data_start = (pos + alignment - 1) / alignment * alignment;
-    std::cout << "GGUF Index built! Data section starts at byte: " << data_start << std::endl;
-
-    // Target Layer: blocks.0.attn.qkv_proj
     std::string prefix = "blocks.0.attn.qkv_proj";
-    std::cout << "Loading layer: " << prefix << std::endl;
+    const uint8_t *h_w = nullptr, *h_sr = nullptr;
+    const float *h_cb = nullptr, *h_sc = nullptr;
+    size_t w_bytes = 0, sr_bytes = 0, cb_bytes = 0, sc_bytes = 0;
+    uint64_t in_features = 5376, out_features = 21504;
 
-    auto& t_w = tensors[prefix + ".weight"];
-    auto& t_cb = tensors[prefix + ".weight_codebook"];
-    auto& t_sc = tensors[prefix + ".weight_s_channel"];
-    auto& t_sr = tensors[prefix + ".weight_s_rel"];
+    if (is_safetensors) {
+        std::cout << "Loading layer from Safetensors: " << prefix << std::endl;
+        auto get_st = [&](const std::string& name) -> std::pair<const uint8_t*, size_t> {
+            auto off = st_hdr[name]["data_offsets"];
+            size_t o0 = off[0].get<size_t>();
+            size_t o1 = off[1].get<size_t>();
+            return {st_base_data + o0, o1 - o0};
+        };
+        auto w_pair = get_st(prefix + ".weight");
+        auto cb_pair = get_st(prefix + ".weight_codebook");
+        auto sr_pair = get_st(prefix + ".weight_s_rel");
+        auto sc_pair = get_st(prefix + ".weight_s_channel");
 
-    uint64_t out_features = t_w.dims[1];
-    uint64_t in_features = t_w.dims[0] * 2; // 4-bit packed
+        h_w = w_pair.first; w_bytes = w_pair.second;
+        h_cb = (const float*)cb_pair.first; cb_bytes = cb_pair.second;
+        h_sr = sr_pair.first; sr_bytes = sr_pair.second;
+        h_sc = (const float*)sc_pair.first; sc_bytes = sc_pair.second;
+
+        auto shape = st_hdr[prefix + ".weight"]["shape"];
+        out_features = shape[0].get<uint64_t>();
+        in_features = shape[1].get<uint64_t>() * 2;
+    } else {
+        uint32_t version = *(const uint32_t*)(data + 4);
+        uint64_t tensor_count = *(const uint64_t*)(data + 8);
+        uint64_t kv_count = *(const uint64_t*)(data + 16);
+        std::cout << "GGUF Header: Version " << version << ", Tensors: " << tensor_count 
+                  << ", KV pairs: " << kv_count << std::endl;
+
+        size_t pos = 24;
+        std::unordered_map<std::string, std::string> metadata;
+        uint64_t alignment = 32;
+
+        for (size_t i = 0; i < kv_count; ++i) {
+            uint64_t key_len = *(const uint64_t*)(data + pos);
+            pos += 8;
+            std::string key((const char*)(data + pos), key_len);
+            pos += key_len;
+            uint32_t val_type = *(const uint32_t*)(data + pos);
+            pos += 4;
+            if (val_type == 8) { // STRING
+                uint64_t slen = *(const uint64_t*)(data + pos);
+                pos += 8;
+                std::string s((const char*)(data + pos), slen);
+                pos += slen;
+                metadata[key] = s;
+            } else if (val_type == 4 || val_type == 5) { // UINT32 / INT32
+                uint32_t v = *(const uint32_t*)(data + pos);
+                pos += 4;
+                metadata[key] = std::to_string(v);
+            } else if (val_type == 10 || val_type == 11) { // UINT64 / INT64
+                uint64_t v = *(const uint64_t*)(data + pos);
+                pos += 8;
+                if (key == "general.alignment") alignment = v;
+                metadata[key] = std::to_string(v);
+            } else if (val_type == 7) { // BOOL
+                uint8_t v = *(const uint8_t*)(data + pos);
+                pos += 1;
+                metadata[key] = v ? "true" : "false";
+            } else if (val_type == 6) { // FLOAT32
+                float v = *(const float*)(data + pos);
+                pos += 4;
+                metadata[key] = std::to_string(v);
+            } else if (val_type == 9) { // ARRAY
+                uint32_t etype = *(const uint32_t*)(data + pos);
+                pos += 4;
+                uint64_t alen = *(const uint64_t*)(data + pos);
+                pos += 8;
+                for (size_t a = 0; a < alen; ++a) {
+                    if (etype == 8) {
+                        uint64_t slen = *(const uint64_t*)(data + pos);
+                        pos += 8 + slen;
+                    } else if (etype == 4 || etype == 5 || etype == 6) {
+                        pos += 4;
+                    } else if (etype == 10 || etype == 11 || etype == 12) {
+                        pos += 8;
+                    } else {
+                        pos += 1;
+                    }
+                }
+            } else {
+                pos += 4;
+            }
+        }
+
+        if (metadata.count("h3.quant.format")) {
+            std::cout << "  h3.quant.format: " << metadata["h3.quant.format"] << std::endl;
+        }
+
+        std::unordered_map<std::string, GGUFTensor> tensors;
+        for (size_t i = 0; i < tensor_count; ++i) {
+            uint64_t name_len = *(const uint64_t*)(data + pos);
+            pos += 8;
+            std::string name((const char*)(data + pos), name_len);
+            pos += name_len;
+            uint32_t n_dims = *(const uint32_t*)(data + pos);
+            pos += 4;
+            std::vector<uint64_t> dims(n_dims);
+            size_t n_elem = 1;
+            for (uint32_t d = 0; d < n_dims; ++d) {
+                dims[d] = *(const uint64_t*)(data + pos);
+                pos += 8;
+                n_elem *= dims[d];
+            }
+            uint32_t type = *(const uint32_t*)(data + pos);
+            pos += 4;
+            uint64_t offset = *(const uint64_t*)(data + pos);
+            pos += 8;
+
+            size_t bsize = n_elem;
+            if (type == 0) bsize *= 4; // F32
+            else if (type == 1 || type == 29) bsize *= 2; // F16 / BF16
+            else if (type == 16) bsize *= 1; // I8 / U8
+
+            tensors[name] = {name, dims, type, offset, bsize};
+        }
+
+        size_t data_start = (pos + alignment - 1) / alignment * alignment;
+        std::cout << "GGUF Index built! Data section starts at byte: " << data_start << std::endl;
+
+        std::cout << "Loading layer: " << prefix << std::endl;
+        auto& t_w = tensors[prefix + ".weight"];
+        auto& t_cb = tensors[prefix + ".weight_codebook"];
+        auto& t_sc = tensors[prefix + ".weight_s_channel"];
+        auto& t_sr = tensors[prefix + ".weight_s_rel"];
+
+        h_w = data + data_start + t_w.offset; w_bytes = t_w.byte_size;
+        h_cb = (const float*)(data + data_start + t_cb.offset); cb_bytes = t_cb.byte_size;
+        h_sr = data + data_start + t_sr.offset; sr_bytes = t_sr.byte_size;
+        h_sc = (const float*)(data + data_start + t_sc.offset); sc_bytes = t_sc.byte_size;
+
+        out_features = t_w.dims[1];
+        in_features = t_w.dims[0] * 2; // 4-bit packed
+    }
 
     std::cout << "  Layer geometry: in_features=" << in_features 
               << ", out_features=" << out_features << std::endl;
@@ -232,17 +283,17 @@ int main(int argc, char** argv) {
     int8_t *d_out_i8 = nullptr;
     half *d_out_f16 = nullptr;
 
-    cudaMalloc(&d_w, t_w.byte_size);
-    cudaMalloc(&d_sr, t_sr.byte_size);
-    cudaMalloc(&d_cb, t_cb.byte_size);
-    cudaMalloc(&d_sc, t_sc.byte_size);
+    cudaMalloc(&d_w, w_bytes);
+    cudaMalloc(&d_sr, sr_bytes);
+    cudaMalloc(&d_cb, cb_bytes);
+    cudaMalloc(&d_sc, sc_bytes);
     cudaMalloc(&d_out_i8, out_features * in_features);
     cudaMalloc(&d_out_f16, out_features * in_features * sizeof(half));
 
-    cudaMemcpy(d_w, data + data_start + t_w.offset, t_w.byte_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sr, data + data_start + t_sr.offset, t_sr.byte_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_cb, data + data_start + t_cb.offset, t_cb.byte_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sc, data + data_start + t_sc.offset, t_sc.byte_size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w, h_w, w_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sr, h_sr, sr_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cb, h_cb, cb_bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sc, h_sc, sc_bytes, cudaMemcpyHostToDevice);
 
     std::cout << "  CUDA Memory mapped & uploaded to RTX 3070 VRAM!" << std::endl;
 

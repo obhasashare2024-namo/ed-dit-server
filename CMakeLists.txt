@@ -506,6 +506,10 @@ if(ED_BUILD_EXAMPLES)
     if(ED_GGML_CUDA)
         add_executable(test-w4a8-direct examples/cli/test_w4a8_direct.cu)
         target_link_libraries(test-w4a8-direct PRIVATE cublas cudart)
+        target_include_directories(test-w4a8-direct PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        )
         target_compile_features(test-w4a8-direct PRIVATE cxx_std_17)
     endif()
 
