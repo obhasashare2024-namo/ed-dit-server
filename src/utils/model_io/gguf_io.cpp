@@ -1,0 +1,201 @@
+#include "gguf_io.h"
+
+#include <cstdint>
+#include <fstream>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "gguf.h"
+#include "gguf_reader_ext.h"
+#include "utils/util.h"
+
+static void set_error(std::string* error, const std::string& message) {
+    if (error != nullptr) {
+        *error = message;
+    }
+}
+
+bool is_gguf_file(const std::string& file_path) {
+    std::ifstream file(file_path, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    char magic[4];
+
+    file.read(magic, sizeof(magic));
+    if (!file) {
+        return false;
+    }
+    for (uint32_t i = 0; i < sizeof(magic); i++) {
+        if (magic[i] != GGUF_MAGIC[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool read_gguf_file(const std::string& file_path,
+                    std::vector<TensorStorage>& tensor_storages,
+                    std::string* error,
+                    std::string* model_version,
+                    std::string* component_kind) {
+    tensor_storages.clear();
+
+    gguf_context* ctx_gguf_ = nullptr;
+    ggml_context* ctx_meta_ = nullptr;
+
+    ctx_gguf_ = gguf_init_from_file(file_path.c_str(), {true, &ctx_meta_});
+    if (!ctx_gguf_) {
+        GGUFReader gguf_reader;
+        if (!gguf_reader.load(file_path)) {
+            set_error(error, "failed to open '" + file_path + "' with GGUFReader");
+            return false;
+        }
+
+        size_t data_offset = gguf_reader.data_offset();
+        for (const auto& gguf_tensor_info : gguf_reader.tensors()) {
+            TensorStorage tensor_storage(
+                gguf_tensor_info.name,
+                gguf_tensor_info.type,
+                gguf_tensor_info.shape.data(),
+                static_cast<int>(gguf_tensor_info.shape.size()),
+                0,
+                data_offset + gguf_tensor_info.offset);
+
+            tensor_storages.push_back(tensor_storage);
+        }
+
+        return true;
+    }
+
+    int n_tensors = static_cast<int>(gguf_get_n_tensors(ctx_gguf_));
+
+    size_t data_offset = gguf_get_data_offset(ctx_gguf_);
+    for (int i = 0; i < n_tensors; i++) {
+        std::string name   = gguf_get_tensor_name(ctx_gguf_, i);
+        ggml_tensor* dummy = ggml_get_tensor(ctx_meta_, name.c_str());
+        size_t offset      = data_offset + gguf_get_tensor_offset(ctx_gguf_, i);
+
+        TensorStorage tensor_storage(name, dummy->type, dummy->ne, ggml_n_dims(dummy), 0, offset);
+
+        if (ggml_nbytes(dummy) != tensor_storage.nbytes()) {
+            gguf_free(ctx_gguf_);
+            ggml_free(ctx_meta_);
+            set_error(error, "size mismatch for tensor '" + name + "'");
+            return false;
+        }
+
+        tensor_storages.push_back(tensor_storage);
+    }
+
+    if (model_version != nullptr) {
+        int64_t version_key_id = gguf_find_key(ctx_gguf_, "edgedit.model_version");
+        if (version_key_id >= 0 && gguf_get_kv_type(ctx_gguf_, version_key_id) == GGUF_TYPE_STRING) {
+            *model_version = gguf_get_val_str(ctx_gguf_, version_key_id);
+        } else {
+            // Fall back to the standard "general.architecture" key so a third-party
+            // or official diffusers-structured GGUF (which carries no edge-dit key,
+            // e.g. "general.architecture" = "sd3" / "flux") is still version-tagged.
+            // ed_version_from_name() ignores values it doesn't recognize, so this is
+            // a safe best-effort hint that never regresses edge-dit's own GGUFs.
+            int64_t arch_key_id = gguf_find_key(ctx_gguf_, "general.architecture");
+            if (arch_key_id >= 0 && gguf_get_kv_type(ctx_gguf_, arch_key_id) == GGUF_TYPE_STRING) {
+                *model_version = gguf_get_val_str(ctx_gguf_, arch_key_id);
+            }
+        }
+    }
+
+    if (component_kind != nullptr) {
+        int64_t component_key_id = gguf_find_key(ctx_gguf_, "edgedit.component_kind");
+        if (component_key_id >= 0 && gguf_get_kv_type(ctx_gguf_, component_key_id) == GGUF_TYPE_STRING) {
+            *component_kind = gguf_get_val_str(ctx_gguf_, component_key_id);
+        }
+    }
+
+    gguf_free(ctx_gguf_);
+    ggml_free(ctx_meta_);
+
+    return true;
+}
+
+bool read_imatrix_gguf(const std::string& file_path,
+                       std::map<std::string, std::vector<float>>& imatrix,
+                       std::string* error) {
+    imatrix.clear();
+
+    ggml_context* ctx_meta = nullptr;
+    // no_alloc = false: allocate and load tensor data so we can read the F32 vectors.
+    gguf_context* ctx_gguf = gguf_init_from_file(file_path.c_str(), {false, &ctx_meta});
+    if (ctx_gguf == nullptr) {
+        set_error(error, "failed to open imatrix GGUF '" + file_path + "'");
+        return false;
+    }
+
+    int n_tensors = static_cast<int>(gguf_get_n_tensors(ctx_gguf));
+    int n_skipped = 0;
+    for (int i = 0; i < n_tensors; i++) {
+        std::string name   = gguf_get_tensor_name(ctx_gguf, i);
+        ggml_tensor* tensor = ggml_get_tensor(ctx_meta, name.c_str());
+        if (tensor == nullptr || tensor->data == nullptr) {
+            ++n_skipped;
+            continue;
+        }
+        if (tensor->type != GGML_TYPE_F32) {
+            LOG_WARN("imatrix tensor '%s' is not F32 (type=%d); skipping", name.c_str(), (int)tensor->type);
+            ++n_skipped;
+            continue;
+        }
+        const int64_t n = ggml_nelements(tensor);
+        const float* src = static_cast<const float*>(tensor->data);
+        imatrix.emplace(name, std::vector<float>(src, src + n));
+    }
+
+    LOG_INFO("read imatrix GGUF '%s': %zu vectors (%d skipped)",
+             file_path.c_str(), imatrix.size(), n_skipped);
+
+    gguf_free(ctx_gguf);
+    ggml_free(ctx_meta);
+    return true;
+}
+
+bool write_gguf_file(const std::string& file_path,
+                     const std::vector<TensorWriteInfo>& tensors,
+                     const std::string& model_version,
+                     const std::string& component_kind,
+                     std::string* error) {
+    gguf_context* gguf_ctx = gguf_init_empty();
+    if (gguf_ctx == nullptr) {
+        set_error(error, "gguf_init_empty failed");
+        return false;
+    }
+
+    // Stamp the true model version (from ed-convert) into GGUF metadata so the
+    // loader need not guess it from the file name.
+    if (!model_version.empty()) {
+        gguf_set_val_str(gguf_ctx, "edgedit.model_version", model_version.c_str());
+    }
+    if (!component_kind.empty()) {
+        gguf_set_val_str(gguf_ctx, "edgedit.component_kind", component_kind.c_str());
+    }
+
+    for (const TensorWriteInfo& write_tensor : tensors) {
+        ggml_tensor* tensor = write_tensor.tensor;
+        if (tensor == nullptr) {
+            set_error(error, "null tensor cannot be written to GGUF");
+            gguf_free(gguf_ctx);
+            return false;
+        }
+        gguf_add_tensor(gguf_ctx, tensor);
+    }
+
+    LOG_INFO("trying to save tensors to %s", file_path.c_str());
+    bool success = gguf_write_to_file(gguf_ctx, file_path.c_str(), false);
+    if (!success) {
+        set_error(error, "failed to write GGUF file '" + file_path + "'");
+    }
+    gguf_free(gguf_ctx);
+    return success;
+}

@@ -1,0 +1,1910 @@
+#ifndef __ED_DIT_MODELS_MODELS_MINIMAX_H3_FULL_HPP__
+#define __ED_DIT_MODELS_MODELS_MINIMAX_H3_FULL_HPP__
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <set>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+#include "backend/ggml/ggml_graph_cut.h"
+#include "dit_models/components/common/common_dit.hpp"
+#include "backend/ggml/ed_ggml_modulation_ext.hpp"
+#include "backend/ggml/ggml_extend.hpp"
+#include "dit_models/components/common/rope.hpp"
+
+namespace MiniMaxH3 {
+
+    constexpr int H3_GRAPH_SIZE          = 131072;
+    constexpr float FRAME_RESCALE        = 5.f / 3.f;
+    constexpr float VISUAL_COND_TIMESTEP = 0.999f;
+
+    static bool h3_env_flag_enabled(const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && value[0] != '\0' && std::atoi(value) != 0;
+    }
+
+    static bool h3_env_flag_enabled_or_default(const char* name, bool default_enabled) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') {
+            return default_enabled;
+        }
+        return std::atoi(value) != 0;
+    }
+
+    static bool h3_trace_first_step_enabled() {
+        if (!h3_env_flag_enabled("ED_MINIMAX_H3_TRACE")) {
+            return false;
+        }
+        const char* step = std::getenv("ED_MINIMAX_H3_CURRENT_STEP");
+        return step == nullptr || std::atoi(step) == 0;
+    }
+
+
+    struct Config {
+        int64_t hidden_size              = 5376;
+        int64_t num_layers               = 50;
+        int64_t token_refiner_num_layers = 2;
+        int64_t num_attention_heads      = 56;
+        int64_t attention_head_dim       = 128;
+        int64_t ffn_hidden_size          = 14336;
+        int64_t video_latent_channels    = 24;
+        int64_t audio_latent_channels    = 32;
+        int64_t text_dim                 = 5120;
+        int64_t timestep_input_dim       = 256;
+        int64_t time_embed_hidden_size   = 5376;
+        int64_t time_embed_dim           = 2688;
+        int64_t rope_inv_freq_len        = 16;
+        int64_t adaln_curve_grid         = 0;
+        int patch_t                      = 1;
+        int patch_h                      = 2;
+        int patch_w                      = 2;
+        float norm_eps                   = 1e-5f;
+        float qk_norm_eps                = 1e-5f;
+        float final_norm_eps             = 1e-5f;
+
+        bool uses_adaln_curves() const {
+            return adaln_curve_grid > 0;
+        }
+
+        static int64_t count_blocks(const String2TensorStorage& tensors,
+                                    const std::string& prefix) {
+            std::set<int> indices;
+            for (const auto& [name, _] : tensors) {
+                if (!starts_with(name, prefix)) {
+                    continue;
+                }
+                size_t begin = prefix.size();
+                size_t end   = name.find('.', begin);
+                if (end != std::string::npos) {
+                    indices.insert(std::atoi(name.substr(begin, end - begin).c_str()));
+                }
+            }
+            return static_cast<int64_t>(indices.size());
+        }
+
+        static Config detect_from_weights(const String2TensorStorage& tensors,
+                                          const std::string& prefix) {
+            Config config;
+            auto find = [&](const std::string& suffix) -> const TensorStorage* {
+                auto it = tensors.find(prefix + "." + suffix);
+                return it == tensors.end() ? nullptr : &it->second;
+            };
+
+            if (const auto* weight = find("video_patch_proj.weight")) {
+                config.video_latent_channels = weight->ne[0] / 4;
+                config.hidden_size           = weight->ne[1];
+            }
+            if (const auto* weight = find("audio_patch_proj.weight")) {
+                config.audio_latent_channels = weight->ne[0];
+            }
+            config.num_layers               = count_blocks(tensors, prefix + ".blocks.");
+            config.token_refiner_num_layers = count_blocks(tensors, prefix + ".token_refiner.blocks.");
+            if (const auto* weight = find("blocks.0.attn.q_norm.weight")) {
+                config.attention_head_dim = weight->ne[0];
+            }
+            if (const auto* weight = find("blocks.0.attn.qkv_proj.weight")) {
+                int64_t qkv_out_dim = weight->ne[1];
+                if (const auto* k_weight = find("blocks.0.attn.qkv_proj.weight.1")) {
+                    qkv_out_dim += k_weight->ne[1];
+                }
+                if (const auto* v_weight = find("blocks.0.attn.qkv_proj.weight.2")) {
+                    qkv_out_dim += v_weight->ne[1];
+                }
+                config.num_attention_heads = qkv_out_dim / (3 * config.attention_head_dim);
+            }
+            if (const auto* weight = find("blocks.0.mlp.fc1.weight")) {
+                config.ffn_hidden_size = weight->ne[1] / 2;
+            }
+            if (const auto* weight = find("condition_proj.weight")) {
+                config.text_dim = weight->ne[0];
+            }
+            if (const auto* table = find("adaln_t_table")) {
+                config.time_embed_dim   = table->ne[0];
+                config.adaln_curve_grid = table->ne[1];
+            } else {
+                if (const auto* weight = find("time_embedder.proj_in.weight")) {
+                    config.timestep_input_dim     = weight->ne[0];
+                    config.time_embed_hidden_size = weight->ne[1];
+                }
+                if (const auto* weight = find("time_embedder.proj_out.weight")) {
+                    config.time_embed_dim = weight->ne[1];
+                }
+            }
+            if (const auto* inv_freq = find("rope.inv_freq")) {
+                config.rope_inv_freq_len = inv_freq->ne[0];
+            }
+
+            LOG_DEBUG("minimax_h3: layers=%" PRId64 ", hidden=%" PRId64 ", heads=%" PRId64
+                      ", head_dim=%" PRId64 ", ffn=%" PRId64 ", adaln_curve=%" PRId64,
+                      config.num_layers,
+                      config.hidden_size,
+                      config.num_attention_heads,
+                      config.attention_head_dim,
+                      config.ffn_hidden_size,
+                      config.adaln_curve_grid);
+            return config;
+        }
+    };
+
+    static float time_shift_sigma(float sigma, float from_shift, float to_shift) {
+        float base = sigma / (from_shift + sigma * (1.f - from_shift));
+        return to_shift * base / (1.f + (to_shift - 1.f) * base);
+    }
+
+    static float time_shift_slope(float sigma, float from_shift, float to_shift) {
+        float base = sigma / (from_shift + sigma * (1.f - from_shift));
+        float a    = 1.f + (from_shift - 1.f) * base;
+        float b    = 1.f + (to_shift - 1.f) * base;
+        return to_shift * a * a / (from_shift * b * b);
+    }
+
+    struct TimeEmbedder : public GGMLBlock {
+        TimeEmbedder(int64_t input_dim, int64_t hidden_dim, int64_t output_dim) {
+            blocks["proj_in"]  = std::make_shared<Linear>(input_dim, hidden_dim, true, true);
+            blocks["proj_out"] = std::make_shared<Linear>(hidden_dim, output_dim, true, true);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto proj_in  = std::dynamic_pointer_cast<Linear>(blocks["proj_in"]);
+            auto proj_out = std::dynamic_pointer_cast<Linear>(blocks["proj_out"]);
+            return proj_out->forward(ctx, ggml_silu(ctx->ggml_ctx, proj_in->forward(ctx, x)));
+        }
+    };
+
+    
+    struct LowRankLinear : public UnaryBlock {
+        int64_t in_features;
+        int64_t rank;
+        int64_t out_features;
+        bool has_bias;
+        float scale = 1.0f;
+        bool force_prec_f32 = false;
+
+        LowRankLinear(int64_t in_features,
+                      int64_t rank,
+                      int64_t out_features,
+                      bool bias = false,
+                      bool force_prec_f32 = false,
+                      float scale = 1.f,
+                      bool scale_quantized_only = false)
+            : in_features(in_features), rank(rank), out_features(out_features), has_bias(bias),
+              scale(scale), force_prec_f32(force_prec_f32) {
+            blocks["down"] = std::make_shared<Linear>(in_features, rank, false, false, force_prec_f32, scale, scale_quantized_only);
+            blocks["up"]   = std::make_shared<Linear>(rank, out_features, bias, false, force_prec_f32, scale, scale_quantized_only);
+        }
+
+        void set_scale(float s) {
+            scale = s;
+            std::dynamic_pointer_cast<Linear>(blocks["down"])->set_scale(s);
+            std::dynamic_pointer_cast<Linear>(blocks["up"])->set_scale(s);
+        }
+
+        void set_force_prec_f32(bool f) {
+            force_prec_f32 = f;
+            std::dynamic_pointer_cast<Linear>(blocks["down"])->set_force_prec_f32(f);
+            std::dynamic_pointer_cast<Linear>(blocks["up"])->set_force_prec_f32(f);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            auto down = std::dynamic_pointer_cast<Linear>(blocks["down"]);
+            auto up   = std::dynamic_pointer_cast<Linear>(blocks["up"]);
+            return up->forward(ctx, down->forward(ctx, x));
+        }
+    };
+
+    struct MLP : public UnaryBlock {
+        int64_t hidden_size;
+        int64_t ffn_hidden_size;
+
+        MLP(int64_t hidden_size,
+            int64_t ffn_hidden_size,
+            int64_t rank_fc1 = 0,
+            int64_t rank_fc2 = 0)
+            : hidden_size(hidden_size),
+              ffn_hidden_size(ffn_hidden_size) {
+            if (rank_fc1 > 0) {
+                blocks["fc1"] = std::make_shared<LowRankLinear>(hidden_size, rank_fc1, ffn_hidden_size * 2, false, true, 1.f / 128.f, true);
+            } else {
+                blocks["fc1"] = std::make_shared<Linear>(hidden_size,
+                                                          ffn_hidden_size * 2,
+                                                          false,
+                                                          false,
+                                                          true,
+                                                          1.f / 128.f,
+                                                          true);
+            }
+            if (rank_fc2 > 0) {
+                blocks["fc2"] = std::make_shared<LowRankLinear>(ffn_hidden_size, rank_fc2, hidden_size, false, true, 1.f / 128.f, true);
+            } else {
+                blocks["fc2"] = std::make_shared<Linear>(ffn_hidden_size,
+                                                          hidden_size,
+                                                          false,
+                                                          false,
+                                                          true,
+                                                          1.f / 128.f,
+                                                          true);
+            }
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+            auto fc1_lin = std::dynamic_pointer_cast<Linear>(blocks["fc1"]);
+            auto fc2_lin = std::dynamic_pointer_cast<Linear>(blocks["fc2"]);
+            auto fc1_lr  = std::dynamic_pointer_cast<LowRankLinear>(blocks["fc1"]);
+            auto fc2_lr  = std::dynamic_pointer_cast<LowRankLinear>(blocks["fc2"]);
+
+            if (h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_MLP_INPUT_SCALE")) {
+                if (fc1_lin) fc1_lin->set_scale(1.f);
+                if (fc2_lin) fc2_lin->set_scale(1.f);
+                if (fc1_lr)  fc1_lr->set_scale(1.f);
+                if (fc2_lr)  fc2_lr->set_scale(1.f);
+            }
+            const bool use_mlp_tensor_cores = h3_env_flag_enabled("ED_MINIMAX_H3_MLP_FP16_CUBLAS");
+            const bool use_fc1_tensor_cores = use_mlp_tensor_cores ||
+                                              h3_env_flag_enabled("ED_MINIMAX_H3_FC1_FP16_CUBLAS") ||
+                                              h3_env_flag_enabled_or_default("ED_MINIMAX_H3_FC1_F32_OUTPUT", true);
+            const bool use_fc2_tensor_cores = use_mlp_tensor_cores || h3_env_flag_enabled("ED_MINIMAX_H3_FC2_FP16_CUBLAS");
+            if (fc1_lin) fc1_lin->set_force_prec_f32(!use_fc1_tensor_cores);
+            if (fc2_lin) fc2_lin->set_force_prec_f32(!use_fc2_tensor_cores);
+            if (fc1_lr)  fc1_lr->set_force_prec_f32(!use_fc1_tensor_cores);
+            if (fc2_lr)  fc2_lr->set_force_prec_f32(!use_fc2_tensor_cores);
+
+            auto fc1_fwd = [&](ggml_tensor* in) -> ggml_tensor* {
+                if (fc1_lin) return fc1_lin->forward(ctx, in);
+                return fc1_lr->forward(ctx, in);
+            };
+            auto fc2_fwd = [&](ggml_tensor* in) -> ggml_tensor* {
+                if (fc2_lin) return fc2_lin->forward(ctx, in);
+                return fc2_lr->forward(ctx, in);
+            };
+
+            auto forward_chunk = [&](ggml_tensor* chunk) {
+                auto fc1_output = fc1_fwd(chunk);
+                if (h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_SWIGLU_FUSION")) {
+                    auto uv = ggml_ext_chunk(ctx->ggml_ctx, fc1_output, 2, 0);
+                    return fc2_fwd(ggml_mul(ctx->ggml_ctx,
+                                            ggml_silu(ctx->ggml_ctx, uv[0]),
+                                            uv[1]));
+                }
+                return fc2_fwd(ggml_swiglu(ctx->ggml_ctx, fc1_output));
+            };
+
+            const int64_t sequence = x->ne[1];
+            if (ctx->max_graph_vram_bytes == 0 || sequence <= 32768) {
+                return forward_chunk(x);
+            }
+
+            constexpr size_t min_working_bytes = static_cast<size_t>(512) * 1024 * 1024;
+            const size_t persistent_bytes = ggml_nbytes(x) * 2 + min_working_bytes;
+            const size_t working_bytes = ctx->max_graph_vram_bytes > persistent_bytes
+                                             ? ctx->max_graph_vram_bytes - persistent_bytes
+                                             : min_working_bytes;
+            const size_t bytes_per_token = static_cast<size_t>(3 * ffn_hidden_size + hidden_size) * sizeof(float);
+            int64_t chunk_tokens = static_cast<int64_t>(working_bytes / std::max<size_t>(bytes_per_token, 1));
+            const int64_t max_chunk_tokens = ctx->max_graph_vram_bytes <= static_cast<size_t>(20) * 1024 * 1024 * 1024
+                                                 ? 2048
+                                                 : 32768;
+            chunk_tokens = std::clamp<int64_t>((chunk_tokens / 256) * 256, 2048, max_chunk_tokens);
+            if (chunk_tokens >= sequence) {
+                return forward_chunk(x);
+            }
+
+            std::vector<ggml_tensor*> chunks;
+            for (int64_t start = 0; start < sequence; start += chunk_tokens) {
+                const int64_t end = std::min(sequence, start + chunk_tokens);
+                auto chunk = ggml_ext_slice(ctx->ggml_ctx, x, 1, start, end, true);
+                chunks.push_back(forward_chunk(chunk));
+            }
+            while (chunks.size() > 1) {
+                std::vector<ggml_tensor*> next_level;
+                for (size_t i = 0; i < chunks.size(); i += 2) {
+                    if (i + 1 < chunks.size()) {
+                        next_level.push_back(ggml_concat(ctx->ggml_ctx, chunks[i], chunks[i + 1], 1));
+                    } else {
+                        next_level.push_back(chunks[i]);
+                    }
+                }
+                chunks = std::move(next_level);
+            }
+            return chunks[0];
+        }
+    };
+
+    static ggml_tensor* attention_layout(ggml_context* ctx, ggml_tensor* x) {
+        x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+        return ggml_reshape_3d(ctx, x, x->ne[0], x->ne[1], x->ne[2] * x->ne[3]);
+    }
+
+    static ggml_tensor* apply_partial_rope(ggml_context* ctx,
+                                           ggml_tensor* x,
+                                           ggml_tensor* pe) {
+        int64_t rot_dim = pe->ne[2] * 2;
+        GGML_ASSERT(rot_dim <= x->ne[0]);
+        const bool use_slice_views = !h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_ROPE_SLICE_VIEW");
+        auto rotated = Rope::apply_rope(ctx,
+                                        ggml_ext_slice(ctx, x, 0, 0, rot_dim, !use_slice_views),
+                                        pe,
+                                        false);
+        if (rot_dim == x->ne[0]) {
+            return rotated;
+        }
+        ggml_tensor* tail = nullptr;
+        if (h3_env_flag_enabled("ED_MINIMAX_H3_ROPE_TAIL_VIEW") && x->ne[3] == 1) {
+            tail = ggml_view_3d(ctx,
+                                x,
+                                x->ne[0] - rot_dim,
+                                x->ne[2],
+                                x->ne[1],
+                                x->nb[2],
+                                x->nb[1],
+                                static_cast<size_t>(rot_dim) * x->nb[0]);
+        } else {
+            tail = attention_layout(ctx, ggml_ext_slice(ctx, x, 0, rot_dim, x->ne[0], !use_slice_views));
+        }
+        return ggml_concat(ctx, rotated, tail, 0);
+    }
+
+    static std::vector<ggml_tensor*> h3_qkv_views(ggml_context* ctx,
+                                                  ggml_tensor* qkv,
+                                                  int64_t head_dim,
+                                                  int64_t heads,
+                                                  int64_t sequence,
+                                                  int64_t batch) {
+        const int64_t inner = head_dim * heads;
+        std::vector<ggml_tensor*> views;
+        views.reserve(3);
+        for (int i = 0; i < 3; ++i) {
+            views.push_back(ggml_view_4d(ctx,
+                                         qkv,
+                                         head_dim,
+                                         heads,
+                                         sequence,
+                                         batch,
+                                         head_dim * qkv->nb[0],
+                                         qkv->nb[1],
+                                         qkv->nb[2],
+                                         static_cast<size_t>(i) * inner * qkv->nb[0]));
+        }
+        return views;
+    }
+
+    struct Attention : public GGMLBlock {
+        int64_t heads;
+        int64_t head_dim;
+        bool is_factorized = false;
+
+        Attention(int64_t hidden_size,
+                  int64_t heads,
+                  int64_t head_dim,
+                  float eps)
+            : heads(heads), head_dim(head_dim), is_factorized(false) {
+            int64_t inner      = heads * head_dim;
+            blocks["qkv_proj"] = std::make_shared<Linear>(hidden_size, inner * 3, false);
+            blocks["q_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
+            blocks["k_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
+            blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false);
+        }
+
+        Attention(int64_t hidden_size,
+                  int64_t heads,
+                  int64_t head_dim,
+                  float eps,
+                  int64_t rank_q,
+                  int64_t rank_k,
+                  int64_t rank_v,
+                  int64_t rank_out)
+            : heads(heads), head_dim(head_dim), is_factorized(rank_q > 0) {
+            int64_t inner      = heads * head_dim;
+            if (rank_q > 0) {
+                blocks["q_proj"]   = std::make_shared<LowRankLinear>(hidden_size, rank_q, inner, false);
+                blocks["k_proj"]   = std::make_shared<LowRankLinear>(hidden_size, rank_k, inner, false);
+                blocks["v_proj"]   = std::make_shared<LowRankLinear>(hidden_size, rank_v, inner, false);
+            } else {
+                blocks["qkv_proj"] = std::make_shared<Linear>(hidden_size, inner * 3, false);
+            }
+            blocks["q_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
+            blocks["k_norm"]   = std::make_shared<RMSNorm>(head_dim, eps);
+            if (rank_out > 0) {
+                blocks["out_proj"] = std::make_shared<LowRankLinear>(inner, rank_out, hidden_size, false);
+            } else {
+                blocks["out_proj"] = std::make_shared<Linear>(inner, hidden_size, false);
+            }
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             ggml_tensor* pe = nullptr) {
+            auto q_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
+            auto k_norm   = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+
+            int64_t sequence = x->ne[1];
+            int64_t batch    = x->ne[2] * x->ne[3];
+            const int64_t inner = heads * head_dim;
+            const size_t attention_activation_bytes =
+                static_cast<size_t>(sequence) * static_cast<size_t>(batch) *
+                    static_cast<size_t>(3 * x->ne[0] + 6 * inner) * sizeof(float) +
+                static_cast<size_t>(1) * 1024 * 1024 * 1024;
+            const bool low_memory_attention = ctx->max_graph_vram_bytes > 0 &&
+                                              sequence > 4096 &&
+                                              attention_activation_bytes > ctx->max_graph_vram_bytes;
+            auto out_proj = std::dynamic_pointer_cast<UnaryBlock>(blocks["out_proj"]);
+
+            // Chunked Flash Attention via persistent KV workspace for both factorized and standard layers
+            if (low_memory_attention && ctx->kv_workspace_buffer != nullptr && ctx->gf != nullptr) {
+                int64_t Lc = 4096;
+                auto qkv_proj = is_factorized ? nullptr : std::dynamic_pointer_cast<Linear>(blocks["qkv_proj"]);
+                auto q_proj   = is_factorized ? std::dynamic_pointer_cast<UnaryBlock>(blocks["q_proj"]) : nullptr;
+                auto k_proj   = is_factorized ? std::dynamic_pointer_cast<UnaryBlock>(blocks["k_proj"]) : nullptr;
+                auto v_proj   = is_factorized ? std::dynamic_pointer_cast<UnaryBlock>(blocks["v_proj"]) : nullptr;
+
+                ggml_tensor* k_full = ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F16, head_dim, sequence, heads);
+                ggml_tensor* v_full = ggml_new_tensor_3d(ctx->ggml_ctx, GGML_TYPE_F16, head_dim, sequence, heads);
+                char* ws_base = (char*)ggml_backend_buffer_get_base(ctx->kv_workspace_buffer);
+                ggml_backend_tensor_alloc(ctx->kv_workspace_buffer, k_full, ws_base);
+                ggml_backend_tensor_alloc(ctx->kv_workspace_buffer, v_full, ws_base + ggml_backend_buffer_get_alloc_size(ctx->kv_workspace_buffer, k_full));
+
+                ggml_tensor* out_final = ggml_new_tensor_2d(ctx->ggml_ctx, GGML_TYPE_F32, x->ne[0], sequence);
+
+                // Phase 1: Chunked K and V projection directly into k_full / v_full views
+                for (int64_t start = 0; start < sequence; start += Lc) {
+                    int64_t n = std::min(sequence - start, Lc);
+                    ggml_tensor* x_c = ggml_view_2d(ctx->ggml_ctx, x, x->ne[0], n, x->nb[1], start * x->nb[1]);
+
+                    // K chunk
+                    ggml_tensor* k_c = is_factorized ? k_proj->forward(ctx, x_c) : qkv_proj->forward_output_slice(ctx, x_c, inner, inner);
+                    k_c = ggml_reshape_4d(ctx->ggml_ctx, k_c, head_dim, heads, n, batch);
+                    k_c = k_norm->forward(ctx, k_c);
+                    if (pe != nullptr) {
+                        ggml_tensor* pe_c = ggml_view_4d(ctx->ggml_ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], n,
+                                                         pe->nb[1], pe->nb[2], pe->nb[3], (size_t)start * pe->nb[3]);
+                        k_c = apply_partial_rope(ctx->ggml_ctx, k_c, pe_c);
+                    } else {
+                        k_c = attention_layout(ctx->ggml_ctx, k_c);
+                    }
+                    k_c = ggml_cast(ctx->ggml_ctx, k_c, GGML_TYPE_F16);
+                    ggml_tensor* k_dst = ggml_view_3d(ctx->ggml_ctx, k_full, head_dim, n, heads, k_full->nb[1], k_full->nb[2], start * k_full->nb[1]);
+                    ggml_build_forward_expand(ctx->gf, ggml_cpy(ctx->ggml_ctx, k_c, k_dst));
+
+                    // V chunk
+                    ggml_tensor* v_c = is_factorized ? v_proj->forward(ctx, x_c) : qkv_proj->forward_output_slice(ctx, x_c, 2 * inner, inner);
+                    v_c = ggml_reshape_4d(ctx->ggml_ctx, v_c, head_dim, heads, n, batch);
+                    v_c = attention_layout(ctx->ggml_ctx, v_c);
+                    v_c = ggml_cast(ctx->ggml_ctx, v_c, GGML_TYPE_F16);
+                    ggml_tensor* v_dst = ggml_view_3d(ctx->ggml_ctx, v_full, head_dim, n, heads, v_full->nb[1], v_full->nb[2], start * v_full->nb[1]);
+                    ggml_build_forward_expand(ctx->gf, ggml_cpy(ctx->ggml_ctx, v_c, v_dst));
+                }
+
+                // Phase 2: Chunked Q & Flash Attention directly into out_final view
+                for (int64_t start = 0; start < sequence; start += Lc) {
+                    int64_t n = std::min(sequence - start, Lc);
+                    ggml_tensor* x_c = ggml_view_2d(ctx->ggml_ctx, x, x->ne[0], n, x->nb[1], start * x->nb[1]);
+
+                    ggml_tensor* q_c = is_factorized ? q_proj->forward(ctx, x_c) : qkv_proj->forward_output_slice(ctx, x_c, 0, inner);
+                    q_c = ggml_reshape_4d(ctx->ggml_ctx, q_c, head_dim, heads, n, batch);
+                    q_c = q_norm->forward(ctx, q_c);
+                    if (pe != nullptr) {
+                        ggml_tensor* pe_c = ggml_view_4d(ctx->ggml_ctx, pe, pe->ne[0], pe->ne[1], pe->ne[2], n,
+                                                         pe->nb[1], pe->nb[2], pe->nb[3], (size_t)start * pe->nb[3]);
+                        q_c = apply_partial_rope(ctx->ggml_ctx, q_c, pe_c);
+                    } else {
+                        q_c = attention_layout(ctx->ggml_ctx, q_c);
+                    }
+                    q_c = ggml_cast(ctx->ggml_ctx, q_c, GGML_TYPE_F16);
+
+                    ggml_tensor* o_c = ggml_flash_attn_ext(ctx->ggml_ctx, q_c, k_full, v_full, nullptr, 1.0f / sqrtf(head_dim), 0, 0);
+                    ggml_tensor* o_2d = ggml_reshape_2d(ctx->ggml_ctx, o_c, inner, n);
+                    ggml_tensor* out_c = out_proj->forward(ctx, o_2d);
+
+                    ggml_tensor* out_dst = ggml_view_2d(ctx->ggml_ctx, out_final, x->ne[0], n, out_final->nb[1], start * out_final->nb[1]);
+                    ggml_build_forward_expand(ctx->gf, ggml_cpy(ctx->ggml_ctx, out_c, out_dst));
+                }
+                ggml_build_forward_expand(ctx->gf, out_final);
+                return out_final;
+            }
+
+            std::vector<ggml_tensor*> qkv;
+            if (is_factorized) {
+                auto q_proj = std::dynamic_pointer_cast<UnaryBlock>(blocks["q_proj"]);
+                auto k_proj = std::dynamic_pointer_cast<UnaryBlock>(blocks["k_proj"]);
+                auto v_proj = std::dynamic_pointer_cast<UnaryBlock>(blocks["v_proj"]);
+                auto q_out = q_proj->forward(ctx, x);
+                auto k_out = k_proj->forward(ctx, x);
+                auto v_out = v_proj->forward(ctx, x);
+                qkv.push_back(ggml_reshape_4d(ctx->ggml_ctx, q_out, head_dim, heads, sequence, batch));
+                qkv.push_back(ggml_reshape_4d(ctx->ggml_ctx, k_out, head_dim, heads, sequence, batch));
+                qkv.push_back(ggml_reshape_4d(ctx->ggml_ctx, v_out, head_dim, heads, sequence, batch));
+            } else {
+                auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv_proj"]);
+                if (low_memory_attention) {
+                    qkv.reserve(3);
+                    for (int projection = 0; projection < 3; ++projection) {
+                        auto projected = qkv_proj->forward_output_slice(ctx, x, projection * inner, inner);
+                        projected = ggml_reshape_4d(ctx->ggml_ctx, projected, head_dim, heads, sequence, batch);
+                        qkv.push_back(projected);
+                    }
+                } else {
+                    auto qkv_out = qkv_proj->forward(ctx, x);
+                    if (h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_QKV_VIEW")) {
+                        qkv = ggml_ext_chunk(ctx->ggml_ctx, qkv_out, 3, 0);
+                        qkv[0] = ggml_reshape_4d(ctx->ggml_ctx, qkv[0], head_dim, heads, sequence, batch);
+                        qkv[1] = ggml_reshape_4d(ctx->ggml_ctx, qkv[1], head_dim, heads, sequence, batch);
+                        qkv[2] = ggml_reshape_4d(ctx->ggml_ctx, qkv[2], head_dim, heads, sequence, batch);
+                    } else {
+                        qkv = h3_qkv_views(ctx->ggml_ctx, qkv_out, head_dim, heads, sequence, batch);
+                    }
+                }
+            }
+            auto q           = qkv[0];
+            auto k           = qkv[1];
+            auto v           = qkv[2];
+            q                = q_norm->forward(ctx, q);
+            k                = k_norm->forward(ctx, k);
+            if (pe != nullptr) {
+                q = apply_partial_rope(ctx->ggml_ctx, q, pe);
+                k = apply_partial_rope(ctx->ggml_ctx, k, pe);
+            } else {
+                q = attention_layout(ctx->ggml_ctx, q);
+                k = attention_layout(ctx->ggml_ctx, k);
+            }
+            if (low_memory_attention) {
+                q = ggml_cast(ctx->ggml_ctx, q, GGML_TYPE_BF16);
+                k = ggml_cast(ctx->ggml_ctx, k, GGML_TYPE_BF16);
+                v = ggml_cast(ctx->ggml_ctx, v, GGML_TYPE_BF16);
+            }
+            auto out = ggml_ext_attention_ext(ctx->ggml_ctx,
+                                              ctx->backend,
+                                              q,
+                                              k,
+                                              v,
+                                              static_cast<int>(heads),
+                                              nullptr,
+                                              true,
+                                              ctx->flash_attn_enabled,
+                                              1.f / 128.f,
+                                              false);
+            out_proj = std::dynamic_pointer_cast<UnaryBlock>(blocks["out_proj"]);
+            return out_proj->forward(ctx, out);
+        }
+    };
+
+    struct TokenRefinerBlock : public GGMLBlock {
+        TokenRefinerBlock(const Config& config) {
+            blocks["norm1"] = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
+            blocks["norm2"] = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
+            blocks["attn"]  = std::make_shared<Attention>(config.hidden_size,
+                                                         config.num_attention_heads,
+                                                         config.attention_head_dim,
+                                                         config.qk_norm_eps);
+            blocks["mlp"]   = std::make_shared<MLP>(config.hidden_size, config.ffn_hidden_size);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+            auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+            auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+            auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
+            x          = ggml_add(ctx->ggml_ctx, x, attn->forward(ctx, norm1->forward(ctx, x)));
+            return ggml_add(ctx->ggml_ctx, x, mlp->forward(ctx, norm2->forward(ctx, x)));
+        }
+    };
+
+    struct TokenRefiner : public GGMLBlock {
+        int64_t num_layers;
+
+        explicit TokenRefiner(const Config& config)
+            : num_layers(config.token_refiner_num_layers) {
+            for (int64_t i = 0; i < num_layers; ++i) {
+                blocks["blocks." + std::to_string(i)] = std::make_shared<TokenRefinerBlock>(config);
+            }
+            blocks["final_norm"] = std::make_shared<RMSNorm>(config.hidden_size, config.final_norm_eps);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) {
+            for (int64_t i = 0; i < num_layers; ++i) {
+                auto block = std::dynamic_pointer_cast<TokenRefinerBlock>(blocks["blocks." + std::to_string(i)]);
+                x          = block->forward(ctx, x);
+                if (ctx->max_graph_vram_bytes > 0) {
+                    sd::ggml_graph_cut::mark_graph_cut(x, "token_refiner.blocks." + std::to_string(i), "refiner_block");
+                }
+            }
+            auto out = std::dynamic_pointer_cast<RMSNorm>(blocks["final_norm"])->forward(ctx, x);
+            if (ctx->max_graph_vram_bytes > 0) {
+                sd::ggml_graph_cut::mark_graph_cut(out, "token_refiner.final_norm", "refined_context");
+            }
+            return out;
+        }
+    };
+
+    struct AdaLayerNormModulation : public GGMLBlock {
+        int64_t hidden_size;
+        int expand;
+        int modalities;
+        bool apply_silu;
+
+        AdaLayerNormModulation(int64_t time_dim,
+                               int64_t hidden_size,
+                               int expand,
+                               int modalities,
+                               bool apply_silu,
+                               bool force_f32)
+            : hidden_size(hidden_size),
+              expand(expand),
+              modalities(modalities),
+              apply_silu(apply_silu) {
+            blocks["linear"] = std::make_shared<Linear>(time_dim,
+                                                        hidden_size * expand * modalities,
+                                                        true,
+                                                        force_f32);
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* t_emb) {
+            if (apply_silu) {
+                t_emb = ggml_silu(ctx->ggml_ctx, t_emb);
+            }
+            return std::dynamic_pointer_cast<Linear>(blocks["linear"])->forward(ctx, t_emb);
+        }
+    };
+
+    struct TokenModulationSpan {
+        int64_t start;
+        int64_t end;
+        int64_t modulation_row;
+    };
+
+    enum class SequenceKind {
+        TEXT,
+        CONDITION_VIDEO,
+        CONDITION_AUDIO,
+        TARGET_AUDIO,
+        TARGET_VIDEO,
+    };
+
+    struct SequenceSegment {
+        int64_t start;
+        int64_t end;
+        SequenceKind kind;
+        int32_t source_index = -1;
+    };
+
+    static std::vector<ggml_tensor*> modulation_row(ggml_context* ctx,
+                                                    ggml_tensor* projection,
+                                                    int64_t hidden_size,
+                                                    int expand,
+                                                    int modalities,
+                                                    int64_t row) {
+        int64_t timestep_rows = projection->ne[1];
+        auto reshaped         = ggml_reshape_2d(ctx,
+                                                projection,
+                                                hidden_size * expand,
+                                                timestep_rows * modalities);
+        const bool use_views  = !h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_SEGMENT_VIEW");
+        auto selected         = ggml_ext_slice(ctx, reshaped, 1, row, row + 1, !use_views);
+        return ggml_ext_chunk(ctx, selected, expand, 0, !use_views);
+    }
+
+    static ggml_tensor* modulate_segments(ggml_context* ctx,
+                                          ggml_tensor* x,
+                                          ggml_tensor* projection,
+                                          const std::vector<TokenModulationSpan>& segments,
+                                          int64_t hidden_size,
+                                          int expand,
+                                          int modalities,
+                                          int shift_index,
+                                          int scale_index) {
+        ggml_tensor* out = nullptr;
+        for (const auto& segment : segments) {
+            auto mods = modulation_row(ctx,
+                                       projection,
+                                       hidden_size,
+                                       expand,
+                                       modalities,
+                                       segment.modulation_row);
+            const bool use_views = !h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_SEGMENT_VIEW");
+            auto part = ggml_ext_slice(ctx, x, 1, segment.start, segment.end, !use_views);
+            if (h3_env_flag_enabled("ED_MINIMAX_H3_FUSED_SEGMENT_MODULATION") ||
+                h3_env_flag_enabled("ED_MINIMAX_H3_FUSED_SEGMENT_MODULATE")) {
+                if (auto fused = edgedit::ggml_ext::fused_modulate_custom(ctx, part, mods[shift_index], mods[scale_index])) {
+                    part = fused;
+                } else {
+                    part = ggml_add(ctx,
+                                    ggml_add(ctx, part, ggml_mul(ctx, part, mods[scale_index])),
+                                    mods[shift_index]);
+                }
+            } else {
+                part = ggml_add(ctx,
+                                ggml_add(ctx, part, ggml_mul(ctx, part, mods[scale_index])),
+                                mods[shift_index]);
+            }
+            out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
+        }
+        return out;
+    }
+
+    static ggml_tensor* gated_residual_segments(ggml_context* ctx,
+                                                ggml_tensor* x,
+                                                ggml_tensor* update,
+                                                ggml_tensor* projection,
+                                                const std::vector<TokenModulationSpan>& segments,
+                                                int64_t hidden_size,
+                                                int gate_index) {
+        ggml_tensor* out = nullptr;
+        for (const auto& segment : segments) {
+            auto mods = modulation_row(ctx, projection, hidden_size, 6, 3, segment.modulation_row);
+            const bool use_views = !h3_env_flag_enabled("ED_MINIMAX_H3_DISABLE_SEGMENT_VIEW");
+            auto base = ggml_ext_slice(ctx, x, 1, segment.start, segment.end, !use_views);
+            auto add  = ggml_ext_slice(ctx, update, 1, segment.start, segment.end, !use_views);
+            ggml_tensor* part = nullptr;
+            if (h3_env_flag_enabled("ED_MINIMAX_H3_FUSED_SEGMENT_MODULATION") ||
+                h3_env_flag_enabled("ED_MINIMAX_H3_FUSED_SEGMENT_RESIDUAL_GATE")) {
+                part = edgedit::ggml_ext::fused_residual_gate_custom(ctx, base, add, mods[gate_index]);
+            }
+            if (part == nullptr) {
+                part = ggml_add(ctx, base, ggml_mul(ctx, add, mods[gate_index]));
+            }
+            out       = out == nullptr ? part : ggml_concat(ctx, out, part, 1);
+        }
+        return out;
+    }
+
+    struct TransformerBlock : public GGMLBlock {
+        Config config;
+
+        explicit TransformerBlock(const Config& config)
+            : config(config) {
+            blocks["norm1"]      = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
+            blocks["norm2"]      = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
+            blocks["attn"]       = std::make_shared<Attention>(config.hidden_size,
+                                                         config.num_attention_heads,
+                                                         config.attention_head_dim,
+                                                         config.qk_norm_eps);
+            blocks["mlp"]        = std::make_shared<MLP>(config.hidden_size,
+                                                  config.ffn_hidden_size);
+            blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
+                                                                            config.hidden_size,
+                                                                            6,
+                                                                            3,
+                                                                            !config.uses_adaln_curves(),
+                                                                            config.uses_adaln_curves());
+        }
+
+        TransformerBlock(const Config& config,
+                         int64_t rank_fc1, int64_t rank_fc2,
+                         int64_t rank_q, int64_t rank_k, int64_t rank_v, int64_t rank_out)
+            : config(config) {
+            blocks["norm1"]      = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
+            blocks["norm2"]      = std::make_shared<RMSNorm>(config.hidden_size, config.norm_eps);
+            blocks["attn"]       = std::make_shared<Attention>(config.hidden_size,
+                                                         config.num_attention_heads,
+                                                         config.attention_head_dim,
+                                                         config.qk_norm_eps,
+                                                         rank_q, rank_k, rank_v, rank_out);
+            blocks["mlp"]        = std::make_shared<MLP>(config.hidden_size,
+                                                  config.ffn_hidden_size,
+                                                  rank_fc1, rank_fc2);
+            blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
+                                                                            config.hidden_size,
+                                                                            6,
+                                                                            3,
+                                                                            !config.uses_adaln_curves(),
+                                                                            config.uses_adaln_curves());
+        }
+
+        ggml_tensor* forward(GGMLRunnerContext* ctx,
+                             ggml_tensor* x,
+                             ggml_tensor* t_emb,
+                             const std::vector<TokenModulationSpan>& segments,
+                             ggml_tensor* pe,
+                             const std::string& cut_group,
+                             const std::string& debug_target = {},
+                             ggml_tensor** debug_output = nullptr) {
+            auto norm1 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm1"]);
+            auto norm2 = std::dynamic_pointer_cast<RMSNorm>(blocks["norm2"]);
+            auto attn  = std::dynamic_pointer_cast<Attention>(blocks["attn"]);
+            auto mlp   = std::dynamic_pointer_cast<MLP>(blocks["mlp"]);
+            auto adaln = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
+            auto mods  = adaln->forward(ctx, t_emb);
+            if (debug_output != nullptr && debug_target == "block0_adaln") {
+                *debug_output = mods;
+                return x;
+            }
+            if (debug_output != nullptr && starts_with(debug_target, "block0_mod_")) {
+                const int component = std::atoi(debug_target.substr(std::strlen("block0_mod_")).c_str());
+                if (component >= 0 && component < 6 && !segments.empty()) {
+                    auto selected = modulation_row(ctx->ggml_ctx,
+                                                   mods,
+                                                   config.hidden_size,
+                                                   6,
+                                                   3,
+                                                   segments.front().modulation_row);
+                    *debug_output = selected[component];
+                    return x;
+                }
+            }
+
+            auto h = modulate_segments(ctx->ggml_ctx,
+                                       norm1->forward(ctx, x),
+                                       mods,
+                                       segments,
+                                       config.hidden_size,
+                                       6,
+                                       3,
+                                       0,
+                                       1);
+            if (debug_output != nullptr && debug_target == "block0_attn_input") {
+                *debug_output = h;
+                return x;
+            }
+            auto attn_output = attn->forward(ctx, h, pe);
+            if (debug_output != nullptr && debug_target == "block0_attn_output") {
+                *debug_output = attn_output;
+                return x;
+            }
+            x      = gated_residual_segments(ctx->ggml_ctx,
+                                             x,
+                                             attn_output,
+                                             mods,
+                                             segments,
+                                             config.hidden_size,
+                                             2);
+            if (debug_output != nullptr && debug_target == "block0_after_attn") {
+                *debug_output = x;
+                return x;
+            }
+            if (ctx->max_graph_vram_bytes > 0 && !cut_group.empty()) {
+                sd::ggml_graph_cut::mark_graph_cut(x, cut_group + ".attn.output", "hidden_states");
+            }
+            h      = modulate_segments(ctx->ggml_ctx,
+                                       norm2->forward(ctx, x),
+                                       mods,
+                                       segments,
+                                       config.hidden_size,
+                                       6,
+                                       3,
+                                       3,
+                                       4);
+            if (debug_output != nullptr && debug_target == "block0_mlp_input") {
+                *debug_output = h;
+                return x;
+            }
+            if (ctx->max_graph_vram_bytes > 0 && !cut_group.empty()) {
+                sd::ggml_graph_cut::mark_graph_cut(h, cut_group + ".mlp.input", "mlp_input");
+            }
+            auto mlp_output = mlp->forward(ctx, h);
+            if (debug_output != nullptr && debug_target == "block0_mlp_output") {
+                *debug_output = mlp_output;
+                return x;
+            }
+
+            return gated_residual_segments(ctx->ggml_ctx,
+                                           x,
+                                           mlp_output,
+                                           mods,
+                                           segments,
+                                           config.hidden_size,
+                                           5);
+        }
+    };
+
+    struct FinalLayer : public GGMLBlock {
+        Config config;
+
+        explicit FinalLayer(const Config& config)
+            : config(config) {
+            int64_t video_dim    = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
+            blocks["norm"]       = std::make_shared<RMSNorm>(config.hidden_size, config.final_norm_eps);
+            blocks["adaln_proj"] = std::make_shared<AdaLayerNormModulation>(config.time_embed_dim,
+                                                                            config.hidden_size,
+                                                                            2,
+                                                                            1,
+                                                                            !config.uses_adaln_curves(),
+                                                                            config.uses_adaln_curves());
+            blocks["video_out"]  = std::make_shared<Linear>(config.hidden_size, video_dim, true, true);
+            blocks["audio_out"]  = std::make_shared<Linear>(config.hidden_size, config.audio_latent_channels, true, true);
+        }
+
+        std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
+                                                      ggml_tensor* x,
+                                                      ggml_tensor* t_emb,
+                                                      const TokenModulationSpan& video,
+                                                      const TokenModulationSpan& audio) {
+            auto norm      = std::dynamic_pointer_cast<RMSNorm>(blocks["norm"]);
+            auto adaln     = std::dynamic_pointer_cast<AdaLayerNormModulation>(blocks["adaln_proj"]);
+            auto video_out = std::dynamic_pointer_cast<Linear>(blocks["video_out"]);
+            auto audio_out = std::dynamic_pointer_cast<Linear>(blocks["audio_out"]);
+            auto mods      = adaln->forward(ctx, t_emb);
+            auto apply     = [&](const TokenModulationSpan& segment) {
+                auto row   = modulation_row(ctx->ggml_ctx, mods, config.hidden_size, 2, 1, segment.modulation_row);
+                auto value = norm->forward(ctx, ggml_ext_slice(ctx->ggml_ctx, x, 1, segment.start, segment.end));
+                return ggml_add(ctx->ggml_ctx,
+                                    ggml_add(ctx->ggml_ctx, value, ggml_mul(ctx->ggml_ctx, value, row[1])),
+                                    row[0]);
+            };
+            return {video_out->forward(ctx, apply(video)),
+                    audio_out->forward(ctx, apply(audio))};
+        }
+    };
+
+    struct MiniMaxH3Transformer3DModel : public GGMLBlock {
+        Config config;
+
+        explicit MiniMaxH3Transformer3DModel(const Config& config,
+                                             const String2TensorStorage& tensors = {},
+                                             const std::string& prefix = "model.diffusion_model")
+            : config(config) {
+            int64_t video_dim          = config.video_latent_channels * config.patch_t * config.patch_h * config.patch_w;
+            blocks["video_patch_proj"] = std::make_shared<Linear>(video_dim, config.hidden_size, true, true);
+            blocks["audio_patch_proj"] = std::make_shared<Linear>(config.audio_latent_channels, config.hidden_size, true, true);
+            blocks["condition_proj"]   = std::make_shared<Linear>(config.text_dim, config.hidden_size, true);
+            if (!config.uses_adaln_curves()) {
+                blocks["time_embedder"] = std::make_shared<TimeEmbedder>(config.timestep_input_dim,
+                                                                         config.time_embed_hidden_size,
+                                                                         config.time_embed_dim);
+            }
+            blocks["token_refiner"] = std::make_shared<TokenRefiner>(config);
+            for (int64_t i = 0; i < config.num_layers; ++i) {
+                std::string block_name = "blocks." + std::to_string(i);
+                auto find_rank = [&](const std::string& subname) -> int64_t {
+                    auto it = tensors.find(prefix + "." + block_name + "." + subname);
+                    if (it != tensors.end()) return it->second.ne[1];
+                    it = tensors.find(block_name + "." + subname);
+                    if (it != tensors.end()) return it->second.ne[1];
+                    return 0;
+                };
+                int64_t rank_fc1 = find_rank("mlp.fc1.down.weight");
+                int64_t rank_fc2 = find_rank("mlp.fc2.down.weight");
+                int64_t rank_q   = find_rank("attn.q_proj.down.weight");
+                int64_t rank_k   = find_rank("attn.k_proj.down.weight");
+                int64_t rank_v   = find_rank("attn.v_proj.down.weight");
+                int64_t rank_out = find_rank("attn.out_proj.down.weight");
+
+                if (rank_fc1 > 0 || rank_fc2 > 0 || rank_q > 0 || rank_out > 0) {
+                    blocks[block_name] = std::make_shared<TransformerBlock>(
+                        config, rank_fc1, rank_fc2, rank_q, rank_k, rank_v, rank_out);
+                } else {
+                    blocks[block_name] = std::make_shared<TransformerBlock>(config);
+                }
+            }
+            blocks["final_layer"] = std::make_shared<FinalLayer>(config);
+        }
+
+        void init_params(ggml_context* ctx,
+                         const String2TensorStorage& tensors = {},
+                         const std::string prefix            = "") override {
+            GGMLBlock::init_params(ctx, tensors, prefix);
+            params["rope.inv_freq"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, config.rope_inv_freq_len);
+            if (config.uses_adaln_curves()) {
+                params["adaln_t_table"] = ggml_new_tensor_2d(ctx,
+                                                             GGML_TYPE_F32,
+                                                             config.time_embed_dim,
+                                                             config.adaln_curve_grid);
+            }
+        }
+
+        ggml_tensor* refine_context(GGMLRunnerContext* ctx, ggml_tensor* context) {
+            if (context->ne[0] == config.hidden_size) {
+                return context;
+            }
+            GGML_ASSERT(context->ne[0] == config.text_dim);
+            auto condition_proj = std::dynamic_pointer_cast<Linear>(blocks["condition_proj"]);
+            auto x = condition_proj->forward(ctx, context);
+            if (ctx->max_graph_vram_bytes > 0) {
+                sd::ggml_graph_cut::mark_graph_cut(x, "token_refiner.condition_proj", "projected_context");
+            }
+            auto token_refiner  = std::dynamic_pointer_cast<TokenRefiner>(blocks["token_refiner"]);
+            return token_refiner->forward(ctx, x);
+        }
+
+        ggml_tensor* time_embedding(GGMLRunnerContext* ctx,
+                                    ggml_tensor* timestep_features,
+                                    ggml_tensor* curve_indices,
+                                    ggml_tensor* curve_upper_indices,
+                                    ggml_tensor* curve_fractions) {
+            if (!config.uses_adaln_curves()) {
+                return std::dynamic_pointer_cast<TimeEmbedder>(blocks["time_embedder"])->forward(ctx, timestep_features);
+            }
+            auto lower = ggml_get_rows(ctx->ggml_ctx, params["adaln_t_table"], curve_indices);
+            auto upper = ggml_get_rows(ctx->ggml_ctx, params["adaln_t_table"], curve_upper_indices);
+            return ggml_add(ctx->ggml_ctx,
+                            lower,
+                            ggml_mul(ctx->ggml_ctx,
+                                     ggml_sub(ctx->ggml_ctx, upper, lower),
+                                     curve_fractions));
+        }
+
+        ggml_tensor* build_rope(GGMLRunnerContext* ctx,
+                                ggml_tensor* position_ids) {
+            auto inv            = ggml_reshape_2d(ctx->ggml_ctx,
+                                                  params["rope.inv_freq"],
+                                                  config.rope_inv_freq_len,
+                                                  1);
+            ggml_tensor* angles = nullptr;
+            for (int axis = 0; axis < 3; ++axis) {
+                auto pos          = ggml_ext_slice(ctx->ggml_ctx, position_ids, 0, axis, axis + 1);
+                auto expanded_inv = ggml_repeat_4d(ctx->ggml_ctx,
+                                                   inv,
+                                                   inv->ne[0],
+                                                   pos->ne[1],
+                                                   1,
+                                                   1);
+                auto a            = ggml_mul(ctx->ggml_ctx, expanded_inv, pos);
+                angles            = angles == nullptr ? a : ggml_concat(ctx->ggml_ctx, angles, a, 0);
+            }
+            auto c  = ggml_reshape_4d(ctx->ggml_ctx, ggml_cos(ctx->ggml_ctx, angles), 1, angles->ne[0], angles->ne[1], 1);
+            auto s  = ggml_reshape_4d(ctx->ggml_ctx, ggml_sin(ctx->ggml_ctx, angles), 1, angles->ne[0], angles->ne[1], 1);
+            auto ns = ggml_neg(ctx->ggml_ctx, s);
+            auto pe = ggml_concat(ctx->ggml_ctx, c, ns, 0);
+            pe      = ggml_concat(ctx->ggml_ctx, pe, s, 0);
+            pe      = ggml_concat(ctx->ggml_ctx, pe, c, 0);
+            return ggml_reshape_4d(ctx->ggml_ctx, pe, 2, 2, angles->ne[0], angles->ne[1]);
+        }
+
+        std::pair<ggml_tensor*, ggml_tensor*> forward(GGMLRunnerContext* ctx,
+                                                      ggml_tensor* video,
+                                                      ggml_tensor* audio,
+                                                      ggml_tensor* context,
+                                                      const std::vector<ggml_tensor*>& condition_videos,
+                                                      const std::vector<ggml_tensor*>& condition_audios,
+                                                      ggml_tensor* position_ids,
+                                                      ggml_tensor* timestep_features,
+                                                      ggml_tensor* curve_indices,
+                                                      ggml_tensor* curve_upper_indices,
+                                                      ggml_tensor* curve_fractions,
+                                                      const std::vector<TokenModulationSpan>& segments,
+                                                      const std::vector<SequenceSegment>& sequence_segments,
+                                                      const TokenModulationSpan& video_segment,
+                                                      const TokenModulationSpan& audio_segment,
+                                                      ggml_tensor* audio_slope,
+                                                      const std::string& debug_target = {},
+                                                      ggml_tensor** debug_output = nullptr) {
+            auto video_proj = std::dynamic_pointer_cast<Linear>(blocks["video_patch_proj"]);
+            auto audio_proj = std::dynamic_pointer_cast<Linear>(blocks["audio_patch_proj"]);
+
+            std::vector<std::pair<int64_t, int64_t>> condition_video_ranges;
+            ggml_tensor* video_rows = nullptr;
+            int64_t video_offset    = 0;
+            for (auto condition : condition_videos) {
+                auto rows = DiT::patchify_3d(ctx->ggml_ctx,
+                                             condition,
+                                             config.patch_t,
+                                             config.patch_h,
+                                             config.patch_w,
+                                             1,
+                                             true);
+                condition_video_ranges.push_back({video_offset, video_offset + rows->ne[1]});
+                video_offset += rows->ne[1];
+                video_rows = video_rows == nullptr ? rows : ggml_concat(ctx->ggml_ctx, video_rows, rows, 1);
+            }
+            auto target_video_rows                         = DiT::patchify_3d(ctx->ggml_ctx,
+                                                                              video,
+                                                                              config.patch_t,
+                                                                              config.patch_h,
+                                                                              config.patch_w,
+                                                                              1,
+                                                                              true);
+            std::pair<int64_t, int64_t> target_video_range = {video_offset, video_offset + target_video_rows->ne[1]};
+            video_rows                                     = video_rows == nullptr ? target_video_rows
+                                                                                   : ggml_concat(ctx->ggml_ctx, video_rows, target_video_rows, 1);
+            auto video_embeds                              = video_proj->forward(ctx, video_rows);
+
+            auto pack_audio_rows = [&](ggml_tensor* value) {
+                value = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, value, 2, 0, 1, 3));
+                return ggml_reshape_3d(ctx->ggml_ctx,
+                                       value,
+                                       value->ne[0],
+                                       value->ne[1] * value->ne[2],
+                                       value->ne[3]);
+            };
+            std::vector<std::pair<int64_t, int64_t>> condition_audio_ranges;
+            ggml_tensor* audio_rows = nullptr;
+            int64_t audio_offset    = 0;
+            for (auto condition : condition_audios) {
+                auto rows = pack_audio_rows(condition);
+                condition_audio_ranges.push_back({audio_offset, audio_offset + rows->ne[1]});
+                audio_offset += rows->ne[1];
+                audio_rows = audio_rows == nullptr ? rows : ggml_concat(ctx->ggml_ctx, audio_rows, rows, 1);
+            }
+            audio                                          = pack_audio_rows(audio);
+            std::pair<int64_t, int64_t> target_audio_range = {audio_offset, audio_offset + audio->ne[1]};
+            audio_rows                                     = audio_rows == nullptr ? audio : ggml_concat(ctx->ggml_ctx, audio_rows, audio, 1);
+            auto audio_embeds                              = audio_proj->forward(ctx, audio_rows);
+            context                                        = refine_context(ctx, context);
+
+            ggml_tensor* h = nullptr;
+            auto append    = [&](ggml_tensor* value) {
+                h = h == nullptr ? value : ggml_concat(ctx->ggml_ctx, h, value, 1);
+            };
+            for (const auto& sequence : sequence_segments) {
+                if (sequence.kind == SequenceKind::TEXT) {
+                    append(context);
+                } else if (sequence.kind == SequenceKind::CONDITION_VIDEO) {
+                    GGML_ASSERT(sequence.source_index >= 0 &&
+                                sequence.source_index < static_cast<int32_t>(condition_video_ranges.size()));
+                    auto range = condition_video_ranges[static_cast<size_t>(sequence.source_index)];
+                    append(ggml_ext_slice(ctx->ggml_ctx, video_embeds, 1, range.first, range.second));
+                } else if (sequence.kind == SequenceKind::CONDITION_AUDIO) {
+                    GGML_ASSERT(sequence.source_index >= 0 &&
+                                sequence.source_index < static_cast<int32_t>(condition_audio_ranges.size()));
+                    auto range = condition_audio_ranges[static_cast<size_t>(sequence.source_index)];
+                    append(ggml_ext_slice(ctx->ggml_ctx, audio_embeds, 1, range.first, range.second));
+                } else if (sequence.kind == SequenceKind::TARGET_AUDIO) {
+                    append(ggml_ext_slice(ctx->ggml_ctx,
+                                          audio_embeds,
+                                          1,
+                                          target_audio_range.first,
+                                          target_audio_range.second));
+                } else {
+                    append(ggml_ext_slice(ctx->ggml_ctx,
+                                          video_embeds,
+                                          1,
+                                          target_video_range.first,
+                                          target_video_range.second));
+                }
+            }
+            GGML_ASSERT(h != nullptr);
+
+            auto t_emb = time_embedding(ctx,
+                                        timestep_features,
+                                        curve_indices,
+                                        curve_upper_indices,
+                                        curve_fractions);
+            if (debug_output != nullptr) {
+                if (debug_target == "temb") {
+                    *debug_output = t_emb;
+                    return {nullptr, nullptr};
+                }
+                if (debug_target == "packed_input") {
+                    *debug_output = h;
+                    return {nullptr, nullptr};
+                }
+            }
+            if (ctx->max_graph_vram_bytes > 0) {
+                sd::ggml_graph_cut::mark_graph_cut(h, "minimax_h3.input", "packed_input");
+            }
+            auto pe    = build_rope(ctx, position_ids);
+            for (int64_t i = 0; i < config.num_layers; ++i) {
+                auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["blocks." + std::to_string(i)]);
+                const std::string cut_group = "minimax_h3.blocks." + std::to_string(i);
+                std::string prefix_tag = "block" + std::to_string(i) + "_";
+                std::string block_debug = (debug_target.rfind(prefix_tag, 0) == 0)
+                    ? ("block0_" + debug_target.substr(prefix_tag.length()))
+                    : (debug_target == ("block" + std::to_string(i)) ? "block0" : std::string());
+                h          = block->forward(ctx,
+                                            h,
+                                            t_emb,
+                                            segments,
+                                            pe,
+                                            cut_group,
+                                            block_debug,
+                                            block_debug.empty() ? nullptr : debug_output);
+                if (debug_output != nullptr && *debug_output != nullptr) {
+                    return {nullptr, nullptr};
+                }
+                if (debug_output != nullptr && debug_target == ("block" + std::to_string(i))) {
+                    *debug_output = h;
+                    return {nullptr, nullptr};
+                }
+                sd::ggml_graph_cut::mark_graph_cut(h,
+                                                   cut_group,
+                                                   "hidden_states");
+            }
+
+            auto final_layer = std::dynamic_pointer_cast<FinalLayer>(blocks["final_layer"]);
+            auto output      = final_layer->forward(ctx, h, t_emb, video_segment, audio_segment);
+            auto video_out   = DiT::unpatchify_3d(ctx->ggml_ctx,
+                                                  output.first,
+                                                  video->ne[2] / config.patch_t,
+                                                  video->ne[1] / config.patch_h,
+                                                  video->ne[0] / config.patch_w,
+                                                  config.patch_t,
+                                                  config.patch_h,
+                                                  config.patch_w,
+                                                  true);
+            auto audio_out   = ggml_reshape_4d(ctx->ggml_ctx,
+                                               output.second,
+                                               config.audio_latent_channels,
+                                               audio->ne[1] / 2,
+                                               2,
+                                               audio->ne[2]);
+            audio_out        = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, audio_out, 1, 2, 0, 3));
+            video_out        = ggml_ext_scale(ctx->ggml_ctx, video_out, -1.f);
+            audio_out        = ggml_mul(ctx->ggml_ctx, audio_out, ggml_neg(ctx->ggml_ctx, audio_slope));
+            return {video_out, audio_out};
+        }
+    };
+
+    struct PackedSequenceLayout {
+        std::vector<float> positions;
+        std::vector<TokenModulationSpan> segments;
+        std::vector<SequenceSegment> sequence_segments;
+        TokenModulationSpan video_segment{};
+        TokenModulationSpan audio_segment{};
+        std::vector<float> timesteps;
+    };
+
+    static float video_span(int64_t frame) {
+        static const int spans[5] = {1, 4, 4, 4, 4};
+        return FRAME_RESCALE * spans[frame % 5];
+    }
+
+    static std::vector<float> spatial_axis(int64_t dim,
+                                           float sqrt_area) {
+        int64_t count = dim / 2;
+        float ratio   = static_cast<float>(dim) / sqrt_area;
+        std::vector<float> result(static_cast<size_t>(count));
+        for (int64_t i = 0; i < count; ++i) {
+            result[static_cast<size_t>(i)] =
+                (static_cast<float>(i) * (ratio / count) + (1.f - ratio) * 0.5f) * 32.f;
+        }
+        return result;
+    }
+
+    static int find_or_add_timestep(std::vector<float>* values, float value) {
+        auto it = std::find(values->begin(), values->end(), value);
+        if (it != values->end()) {
+            return static_cast<int>(it - values->begin());
+        }
+        values->push_back(value);
+        return static_cast<int>(values->size() - 1);
+    }
+
+    static PackedSequenceLayout build_layout(int64_t text_len,
+                                             int64_t latent_t,
+                                             int64_t latent_h,
+                                             int64_t latent_w,
+                                             int64_t audio_t,
+                                             const std::vector<sd::Tensor<float>>& condition_videos,
+                                             const std::vector<sd::Tensor<float>>& condition_audios,
+                                             const sd::Tensor<int32_t>& keyframe_indices,
+                                             const std::vector<MiniMaxH3ReferenceBlock>& reference_blocks,
+                                             const sd::Tensor<int32_t>& text_tags,
+                                             float video_t,
+                                             float audio_timestep) {
+        PackedSequenceLayout layout;
+        float sqrt_area    = std::sqrt(static_cast<float>(latent_h * latent_w));
+        auto h_axis        = spatial_axis(latent_h, sqrt_area);
+        auto w_axis        = spatial_axis(latent_w, sqrt_area);
+        int64_t frame_rows = static_cast<int64_t>(h_axis.size() * w_axis.size());
+        int64_t row        = 0;
+
+        auto append_position = [&](float t, float h, float w) {
+            layout.positions.push_back(t);
+            layout.positions.push_back(h);
+            layout.positions.push_back(w);
+        };
+        for (int64_t i = 0; i < text_len; ++i) {
+            append_position(static_cast<float>(i), 0.f, 0.f);
+        }
+        layout.sequence_segments.push_back({0, text_len, SequenceKind::TEXT});
+
+        int video_time_row           = find_or_add_timestep(&layout.timesteps, video_t);
+        int audio_time_row           = find_or_add_timestep(&layout.timesteps, audio_timestep);
+        int condition_time_row       = find_or_add_timestep(&layout.timesteps,
+                                                            std::max(video_t, VISUAL_COND_TIMESTEP));
+        int audio_condition_time_row = find_or_add_timestep(&layout.timesteps,
+                                                            std::max(audio_timestep, 1.f));
+
+        if (text_len > 0 && text_tags.empty()) {
+            layout.segments.push_back({0, text_len, video_time_row * 3 + 1});
+        } else if (text_len > 0) {
+            int64_t run_start = 0;
+            int current_tag   = text_tags[0];
+            for (int64_t i = 1; i <= text_len; ++i) {
+                int tag = i < text_len ? text_tags[i] : -1;
+                if (i == text_len || tag != current_tag) {
+                    layout.segments.push_back({run_start,
+                                               i,
+                                               video_time_row * 3 + current_tag});
+                    run_start   = i;
+                    current_tag = tag;
+                }
+            }
+        }
+        row = text_len;
+
+        auto condition_spatial_axes = [&](const sd::Tensor<float>& condition) {
+            float area = std::sqrt(static_cast<float>(condition.shape()[0] * condition.shape()[1]));
+            return std::make_pair(spatial_axis(condition.shape()[1], area),
+                                  spatial_axis(condition.shape()[0], area));
+        };
+        auto append_video_positions = [&](const sd::Tensor<float>& condition,
+                                          float cursor) {
+            auto axes = condition_spatial_axes(condition);
+            for (int64_t t = 0; t < condition.shape()[2]; ++t) {
+                for (float h : axes.first) {
+                    for (float w : axes.second) {
+                        append_position(cursor, h, w);
+                    }
+                }
+                cursor += video_span(t);
+            }
+            return cursor;
+        };
+        auto append_audio_positions = [&](int64_t length,
+                                          float cursor,
+                                          float w_low,
+                                          float w_high) {
+            for (int channel = 0; channel < 2; ++channel) {
+                float w = channel == 0 ? w_low : w_high;
+                for (int64_t t = 0; t < length; ++t) {
+                    append_position(cursor + static_cast<float>(t), 0.f, w);
+                }
+            }
+        };
+
+        float cursor = static_cast<float>(text_len);
+        if (reference_blocks.empty()) {
+            float video_duration = 0.f;
+            for (int64_t t = 0; t < latent_t; ++t) {
+                video_duration += video_span(t);
+            }
+            for (size_t index = 0; index < condition_videos.size(); ++index) {
+                const auto& condition = condition_videos[index];
+                auto axes             = condition_spatial_axes(condition);
+                int64_t count         = condition.shape()[2] *
+                                static_cast<int64_t>(axes.first.size() * axes.second.size());
+                bool is_first    = keyframe_indices.empty() || keyframe_indices[static_cast<int64_t>(index)] == 0;
+                float keyframe_t = is_first ? static_cast<float>(text_len)
+                                            : static_cast<float>(text_len) + video_duration - FRAME_RESCALE;
+                for (int64_t t = 0; t < condition.shape()[2]; ++t) {
+                    for (float h : axes.first) {
+                        for (float w : axes.second) {
+                            append_position(keyframe_t, h, w);
+                        }
+                    }
+                }
+                layout.sequence_segments.push_back({row,
+                                                    row + count,
+                                                    SequenceKind::CONDITION_VIDEO,
+                                                    static_cast<int32_t>(index)});
+                layout.segments.push_back({row, row + count, condition_time_row * 3});
+                row += count;
+            }
+        } else {
+            for (const auto& block : reference_blocks) {
+                const sd::Tensor<float>* ref_video = nullptr;
+                const sd::Tensor<float>* ref_audio = nullptr;
+                if (block.video_index >= 0) {
+                    GGML_ASSERT(block.video_index < static_cast<int32_t>(condition_videos.size()));
+                    ref_video = &condition_videos[static_cast<size_t>(block.video_index)];
+                }
+                if (block.audio_index >= 0) {
+                    GGML_ASSERT(block.audio_index < static_cast<int32_t>(condition_audios.size()));
+                    ref_audio = &condition_audios[static_cast<size_t>(block.audio_index)];
+                }
+
+                float block_end = cursor;
+                if (block.kind == MiniMaxH3ReferenceKind::AUDIO ||
+                    block.kind == MiniMaxH3ReferenceKind::VIDEO_AUDIO) {
+                    GGML_ASSERT(ref_audio != nullptr);
+                    float w_low  = w_axis.front();
+                    float w_high = w_axis.back();
+                    if (ref_video != nullptr) {
+                        auto axes = condition_spatial_axes(*ref_video);
+                        w_low     = axes.second.front();
+                        w_high    = axes.second.back();
+                    }
+                    int64_t count = ref_audio->shape()[0] * 2;
+                    append_audio_positions(ref_audio->shape()[0], cursor, w_low, w_high);
+                    layout.sequence_segments.push_back({row,
+                                                        row + count,
+                                                        SequenceKind::CONDITION_AUDIO,
+                                                        block.audio_index});
+                    layout.segments.push_back({row,
+                                               row + count,
+                                               audio_condition_time_row * 3 + 2});
+                    row += count;
+                    block_end = std::max(block_end, cursor + static_cast<float>(ref_audio->shape()[0]));
+                }
+
+                if (block.kind != MiniMaxH3ReferenceKind::AUDIO) {
+                    GGML_ASSERT(ref_video != nullptr);
+                    auto axes     = condition_spatial_axes(*ref_video);
+                    int64_t count = ref_video->shape()[2] *
+                                    static_cast<int64_t>(axes.first.size() * axes.second.size());
+                    float video_end = append_video_positions(*ref_video, cursor);
+                    layout.sequence_segments.push_back({row,
+                                                        row + count,
+                                                        SequenceKind::CONDITION_VIDEO,
+                                                        block.video_index});
+                    layout.segments.push_back({row, row + count, condition_time_row * 3});
+                    row += count;
+                    block_end = block.kind == MiniMaxH3ReferenceKind::IMAGE
+                                    ? std::max(block_end, cursor + 1.f)
+                                    : std::max(block_end, video_end);
+                }
+                cursor = block_end;
+            }
+        }
+
+        int64_t audio_start = row;
+        append_audio_positions(audio_t, cursor, w_axis.front(), w_axis.back());
+        layout.audio_segment = {audio_start, row + audio_t * 2, audio_time_row};
+        layout.sequence_segments.push_back({audio_start,
+                                            row + audio_t * 2,
+                                            SequenceKind::TARGET_AUDIO});
+        layout.segments.push_back({audio_start,
+                                   row + audio_t * 2,
+                                   audio_time_row * 3 + 2});
+        row += audio_t * 2;
+
+        int64_t video_start = row;
+        for (int64_t t = 0; t < latent_t; ++t) {
+            for (float h : h_axis) {
+                for (float w : w_axis) {
+                    append_position(cursor, h, w);
+                }
+            }
+            cursor += video_span(t);
+        }
+        int64_t video_rows   = latent_t * frame_rows;
+        layout.video_segment = {video_start, video_start + video_rows, video_time_row};
+        layout.sequence_segments.push_back({video_start,
+                                            video_start + video_rows,
+                                            SequenceKind::TARGET_VIDEO});
+        layout.segments.push_back({video_start,
+                                   video_start + video_rows,
+                                   video_time_row * 3});
+        return layout;
+    }
+
+    struct MiniMaxH3Runner : public GGMLRunner {
+        Config config;
+        MiniMaxH3Transformer3DModel model;
+        sd::Tensor<float> video_input_cache;
+        sd::Tensor<float> audio_input_cache;
+        sd::Tensor<float> position_input_cache;
+        sd::Tensor<float> timestep_feature_input_cache;
+        sd::Tensor<float> audio_slope_input_cache;
+        sd::Tensor<int32_t> curve_index_input_cache;
+        sd::Tensor<int32_t> curve_upper_index_input_cache;
+        sd::Tensor<float> curve_fraction_input_cache;
+        ggml_backend_buffer_t kv_workspace_buf = nullptr;
+
+        GGMLRunnerContext get_context() override {
+            GGMLRunnerContext ctx = GGMLRunner::get_context();
+            ctx.kv_workspace_buffer = kv_workspace_buf;
+            return ctx;
+        }
+
+        ~MiniMaxH3Runner() {
+            if (kv_workspace_buf != nullptr) {
+                ggml_backend_buffer_free(kv_workspace_buf);
+                kv_workspace_buf = nullptr;
+            }
+        }
+
+        MiniMaxH3Runner(ggml_backend_t backend,
+                        const String2TensorStorage& tensors,
+                        const std::string& prefix                           = "model.diffusion_model",
+                        bool offload_params_to_cpu = false)
+            : GGMLRunner(backend, offload_params_to_cpu),
+              config(Config::detect_from_weights(tensors, prefix)),
+              model(config, tensors, prefix) {
+            model.init(params_ctx, tensors, prefix);
+            // kv_workspace_buf is dynamically allocated in build_graph
+        }
+
+        std::string get_desc() override {
+            return "minimax_h3";
+        }
+
+        void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors,
+                               const std::string& prefix) {
+            model.get_param_tensors(tensors, prefix);
+        }
+
+        std::pair<sd::Tensor<float>, sd::Tensor<float>> split_av_latents(const sd::Tensor<float>& packed,
+                                                                         int audio_length) const {
+            GGML_ASSERT(packed.dim() == 4 || packed.dim() == 5);
+            int64_t spatial      = packed.shape()[0] * packed.shape()[1] * packed.shape()[2];
+            int64_t video_values = spatial * config.video_latent_channels;
+            sd::Tensor<float> video({packed.shape()[0],
+                                     packed.shape()[1],
+                                     packed.shape()[2],
+                                     config.video_latent_channels,
+                                     1});
+            std::copy_n(packed.data(), static_cast<size_t>(video_values), video.data());
+            if (audio_length <= 0) {
+                return {video, {}};
+            }
+            int64_t audio_values = audio_length * 2 * config.audio_latent_channels;
+            GGML_ASSERT(packed.numel() >= video_values + audio_values);
+            sd::Tensor<float> audio({audio_length, 2, config.audio_latent_channels, 1});
+            std::copy_n(packed.data() + video_values,
+                        static_cast<size_t>(audio_values),
+                        audio.data());
+            return {video, audio};
+        }
+
+        size_t measure_compute_buffer_at(int latent_width, int latent_height, int frames) {
+            if (latent_width <= 0 || latent_height <= 0 || frames <= 0) {
+                return 0;
+            }
+            const int latent_frames = frames <= 5 ? 2 : ((frames - 5) / 17) * 5 + 2;
+            const int audio_length = std::max(1, static_cast<int>(std::lround(frames * 40.0 / 24.0)));
+            sd::Tensor<float> video = sd::zeros<float>(
+                {latent_width, latent_height, latent_frames, config.video_latent_channels, 1});
+            sd::Tensor<float> audio = sd::zeros<float>(
+                {audio_length, 2, config.audio_latent_channels, 1});
+            const int64_t spatial_size = video.shape()[0] * video.shape()[1] * video.shape()[2];
+            const int64_t extra_channels = (audio.numel() + spatial_size - 1) / spatial_size;
+            std::vector<int64_t> packed_shape = video.shape();
+            packed_shape[3] += extra_channels;
+            sd::Tensor<float> packed = sd::zeros<float>(packed_shape);
+            std::copy_n(video.data(), video.numel(), packed.data());
+            std::copy_n(audio.data(), audio.numel(), packed.data() + video.numel());
+            sd::Tensor<float> timestep({1}, {1000.0f});
+            sd::Tensor<float> context = sd::zeros<float>({config.text_dim, 256, 1});
+            const sd::Tensor<int32_t> empty_int;
+            std::vector<sd::Tensor<float>> condition_videos;
+            condition_videos.push_back(sd::zeros<float>(video.shape()));
+            condition_videos.push_back(sd::zeros<float>(
+                {latent_width, latent_height, 2, config.video_latent_channels, 1}));
+            std::vector<sd::Tensor<float>> condition_audios;
+            condition_audios.push_back(sd::zeros<float>(audio.shape()));
+            condition_audios.push_back(sd::zeros<float>(audio.shape()));
+            const std::vector<MiniMaxH3ReferenceBlock> reference_blocks = {
+                {MiniMaxH3ReferenceKind::VIDEO_AUDIO, 0, 0},
+                {MiniMaxH3ReferenceKind::IMAGE, 1, -1},
+                {MiniMaxH3ReferenceKind::AUDIO, -1, 1},
+            };
+            auto get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(packed,
+                                   timestep,
+                                   context,
+                                   condition_videos,
+                                   condition_audios,
+                                   empty_int,
+                                   empty_int,
+                                   reference_blocks,
+                                   audio_length,
+                                   12.0f,
+                                   3.0f);
+            };
+            return measure_compute_buffer(get_graph);
+        }
+
+        ggml_tensor* merge_av_latents(ggml_context* ctx,
+                                      ggml_tensor* video,
+                                      ggml_tensor* audio) const {
+            int64_t divisor = video->ne[0] * video->ne[1] * video->ne[2];
+            int64_t values  = ggml_nelements(audio);
+            int64_t padding = (divisor - values % divisor) % divisor;
+            audio           = ggml_reshape_4d(ctx, ggml_cont(ctx, audio), values, 1, 1, 1);
+            if (padding > 0) {
+                audio = ggml_ext_pad(ctx, audio, static_cast<int>(padding), 0, 0, 0);
+            }
+            audio = ggml_reshape_4d(ctx,
+                                    audio,
+                                    video->ne[0],
+                                    video->ne[1],
+                                    video->ne[2],
+                                    (values + padding) / divisor);
+            return ggml_concat(ctx, video, audio, 3);
+        }
+
+        ggml_cgraph* build_graph(const sd::Tensor<float>& packed,
+                                 const sd::Tensor<float>& timestep,
+                                 const sd::Tensor<float>& context_tensor,
+                                 const std::vector<sd::Tensor<float>>& condition_videos,
+                                 const std::vector<sd::Tensor<float>>& condition_audios,
+                                 const sd::Tensor<int32_t>& text_tags,
+                                 const sd::Tensor<int32_t>& keyframe_indices,
+                                 const std::vector<MiniMaxH3ReferenceBlock>& reference_blocks,
+                                 int audio_length,
+                                 float video_shift,
+                                 float audio_shift) {
+            auto split        = split_av_latents(packed, audio_length);
+            video_input_cache = std::move(split.first);
+            audio_input_cache = std::move(split.second);
+            GGML_ASSERT(!audio_input_cache.empty());
+            GGML_ASSERT(!context_tensor.empty());
+
+            auto video   = make_input(video_input_cache);
+            auto audio   = make_input(audio_input_cache);
+            auto context = make_input(context_tensor);
+            std::vector<ggml_tensor*> condition_inputs;
+            condition_inputs.reserve(condition_videos.size());
+            for (const auto& condition : condition_videos) {
+                condition_inputs.push_back(make_input(condition));
+            }
+            std::vector<ggml_tensor*> audio_condition_inputs;
+            audio_condition_inputs.reserve(condition_audios.size());
+            for (const auto& condition : condition_audios) {
+                audio_condition_inputs.push_back(make_input(condition));
+            }
+
+            float sigma_v = std::clamp(timestep[0] / 1000.f, 1e-6f, 1.f);
+            float t_v     = 1.f - sigma_v;
+            float t_a     = 1.f - time_shift_sigma(sigma_v, video_shift, audio_shift);
+            auto layout   = build_layout(context_tensor.shape()[1],
+                                         video_input_cache.shape()[2],
+                                         video_input_cache.shape()[1],
+                                         video_input_cache.shape()[0],
+                                         audio_length,
+                                         condition_videos,
+                                         condition_audios,
+                                         keyframe_indices,
+                                         reference_blocks,
+                                         text_tags,
+                                         t_v,
+                                         t_a);
+
+            if (h3_trace_first_step_enabled()) {
+                auto reference_kind_name = [](MiniMaxH3ReferenceKind kind) {
+                    switch (kind) {
+                        case MiniMaxH3ReferenceKind::IMAGE: return "image";
+                        case MiniMaxH3ReferenceKind::VIDEO: return "video";
+                        case MiniMaxH3ReferenceKind::VIDEO_AUDIO: return "video_audio";
+                        case MiniMaxH3ReferenceKind::AUDIO: return "audio";
+                    }
+                    return "unknown";
+                };
+                std::ostringstream ref_stream;
+                for (size_t index = 0; index < reference_blocks.size(); ++index) {
+                    const auto& block = reference_blocks[index];
+                    if (index > 0) {
+                        ref_stream << ";";
+                    }
+                    ref_stream << index << ":" << reference_kind_name(block.kind)
+                               << "(v=" << block.video_index
+                               << ",a=" << block.audio_index << ")";
+                }
+                LOG_INFO("minimax-h3 trace dit layout: text=%lld target_video=%lldx%lldx%lld target_audio=%d condition_videos=%zu condition_audios=%zu reference_blocks=%zu [%s] packed_tokens=%lld sequence_segments=%zu segments=%zu timesteps=%zu",
+                         static_cast<long long>(context_tensor.shape()[1]),
+                         static_cast<long long>(video_input_cache.shape()[2]),
+                         static_cast<long long>(video_input_cache.shape()[1]),
+                         static_cast<long long>(video_input_cache.shape()[0]),
+                         audio_length,
+                         condition_videos.size(),
+                         condition_audios.size(),
+                         reference_blocks.size(),
+                         ref_stream.str().c_str(),
+                         static_cast<long long>(layout.positions.size() / 3),
+                         layout.sequence_segments.size(),
+                         layout.segments.size(),
+                         layout.timesteps.size());
+                for (size_t index = 0; index < condition_videos.size(); ++index) {
+                    const auto& condition = condition_videos[index];
+                    LOG_INFO("minimax-h3 trace condition_video[%zu]: shape=%lldx%lldx%lldx%lldx%lld",
+                             index,
+                             static_cast<long long>(condition.shape()[0]),
+                             static_cast<long long>(condition.shape()[1]),
+                             static_cast<long long>(condition.shape()[2]),
+                             static_cast<long long>(condition.shape()[3]),
+                             static_cast<long long>(condition.shape()[4]));
+                }
+                for (size_t index = 0; index < condition_audios.size(); ++index) {
+                    const auto& condition = condition_audios[index];
+                    LOG_INFO("minimax-h3 trace condition_audio[%zu]: shape=%lldx%lldx%lld",
+                             index,
+                             static_cast<long long>(condition.shape()[0]),
+                             static_cast<long long>(condition.shape()[1]),
+                             static_cast<long long>(condition.shape()[2]));
+                }
+            }
+
+            position_input_cache = sd::Tensor<float>(
+                {3, static_cast<int64_t>(layout.positions.size() / 3)},
+                layout.positions);
+            auto positions = make_input(position_input_cache);
+
+            ggml_tensor* timestep_features   = nullptr;
+            ggml_tensor* curve_indices       = nullptr;
+            ggml_tensor* curve_upper_indices = nullptr;
+            ggml_tensor* curve_fractions     = nullptr;
+            if (config.uses_adaln_curves()) {
+                std::vector<int32_t> indices(layout.timesteps.size());
+                std::vector<int32_t> upper_indices(layout.timesteps.size());
+                std::vector<float> fractions(layout.timesteps.size());
+                for (size_t i = 0; i < layout.timesteps.size(); ++i) {
+                    float position   = std::clamp(layout.timesteps[i], 0.f, 1.f) * (config.adaln_curve_grid - 1);
+                    int index        = std::min(static_cast<int>(std::floor(position)),
+                                                static_cast<int>(config.adaln_curve_grid - 2));
+                    indices[i]       = index;
+                    upper_indices[i] = index + 1;
+                    fractions[i]     = position - index;
+                }
+                curve_index_input_cache = sd::Tensor<int32_t>(
+                    {static_cast<int64_t>(indices.size())},
+                    indices);
+                curve_upper_index_input_cache = sd::Tensor<int32_t>(
+                    {static_cast<int64_t>(upper_indices.size())},
+                    upper_indices);
+                curve_fraction_input_cache = sd::Tensor<float>(
+                    {1, static_cast<int64_t>(fractions.size())},
+                    fractions);
+                curve_indices       = make_input(curve_index_input_cache);
+                curve_upper_indices = make_input(curve_upper_index_input_cache);
+                curve_fractions     = make_input(curve_fraction_input_cache);
+            } else {
+                timestep_feature_input_cache = sd::Tensor<float>(
+                    {config.timestep_input_dim, static_cast<int64_t>(layout.timesteps.size())},
+                    timestep_embedding(layout.timesteps,
+                                       static_cast<int>(config.timestep_input_dim),
+                                       10000,
+                                       true,
+                                       1.f));
+                timestep_features = make_input(timestep_feature_input_cache);
+            }
+
+            const char* chunked_attn = std::getenv("ED_MINIMAX_H3_CHUNKED_ATTN");
+            if (chunked_attn != nullptr && chunked_attn[0] != '\0' && std::strcmp(chunked_attn, "0") != 0) {
+                const size_t req_seq = layout.positions.size() / 3;
+                const size_t needed_kv_bytes = 2ULL * config.attention_head_dim * req_seq * config.num_attention_heads * sizeof(ggml_fp16_t) + 4096 * 1024;
+                if (kv_workspace_buf == nullptr || ggml_backend_buffer_get_size(kv_workspace_buf) < needed_kv_bytes) {
+                    if (kv_workspace_buf != nullptr) {
+                        ggml_backend_buffer_free(kv_workspace_buf);
+                        kv_workspace_buf = nullptr;
+                    }
+                    kv_workspace_buf = ggml_backend_alloc_buffer(runtime_backend, needed_kv_bytes);
+                }
+            }
+            auto runner_ctx = get_context();
+            auto graph      = new_graph_custom(H3_GRAPH_SIZE);
+            runner_ctx.gf   = graph;
+            audio_slope_input_cache = sd::Tensor<float>(
+                {1},
+                {time_shift_slope(sigma_v, video_shift, audio_shift)});
+            auto audio_slope_tensor = make_input(audio_slope_input_cache);
+            const char* debug_target_env = std::getenv("ED_MINIMAX_H3_DEBUG_TARGET");
+            const std::string debug_target = debug_target_env == nullptr ? std::string() : std::string(debug_target_env);
+            ggml_tensor* debug_output = nullptr;
+            auto output     = model.forward(&runner_ctx,
+                                            video,
+                                            audio,
+                                            context,
+                                            condition_inputs,
+                                            audio_condition_inputs,
+                                            positions,
+                                            timestep_features,
+                                            curve_indices,
+                                            curve_upper_indices,
+                                            curve_fractions,
+                                            layout.segments,
+                                            layout.sequence_segments,
+                                            layout.video_segment,
+                                            layout.audio_segment,
+                                            audio_slope_tensor,
+                                            debug_target,
+                                            &debug_output);
+            auto merged     = debug_output == nullptr
+                                  ? merge_av_latents(compute_ctx, output.first, output.second)
+                                  : debug_output;
+            ggml_build_forward_expand(graph, merged);
+            return graph;
+        }
+
+        sd::Tensor<float> compute(int n_threads,
+                                  const DiffusionParams& params) {
+            GGML_ASSERT(params.x != nullptr && params.timesteps != nullptr && params.context != nullptr);
+            static const std::vector<sd::Tensor<float>> empty_conditions;
+            static const std::vector<MiniMaxH3ReferenceBlock> empty_reference_blocks;
+            const auto& conditions       = params.ref_latents == nullptr ? empty_conditions : *params.ref_latents;
+            const auto& audio_conditions = params.minimax_reference_audio_latents == nullptr
+                                               ? empty_conditions
+                                               : *params.minimax_reference_audio_latents;
+            const auto& reference_blocks = params.minimax_reference_blocks == nullptr
+                                               ? empty_reference_blocks
+                                               : *params.minimax_reference_blocks;
+            const sd::Tensor<int32_t> empty_int;
+            get_graph_cb_t get_graph = [&]() -> ggml_cgraph* {
+                return build_graph(*params.x,
+                                   *params.timesteps,
+                                   *params.context,
+                                   conditions,
+                                   audio_conditions,
+                                   params.minimax_text_token_tags == nullptr ? empty_int : *params.minimax_text_token_tags,
+                                   params.minimax_keyframe_indices == nullptr ? empty_int : *params.minimax_keyframe_indices,
+                                   reference_blocks,
+                                   params.minimax_audio_length,
+                                   params.minimax_video_sigma_shift,
+                                   params.minimax_audio_sigma_shift);
+            };
+            if (h3_env_flag_enabled("ED_MINIMAX_H3_REUSE_GRAPH") &&
+                std::getenv("ED_MINIMAX_H3_DEBUG_TARGET") == nullptr) {
+                auto split_for_reuse = split_av_latents(*params.x, params.minimax_audio_length);
+                video_input_cache = std::move(split_for_reuse.first);
+                audio_input_cache = std::move(split_for_reuse.second);
+                const float sigma_v = std::clamp((*params.timesteps)[0] / 1000.f, 1e-6f, 1.f);
+                const float t_v     = 1.f - sigma_v;
+                const float t_a     = 1.f - time_shift_sigma(sigma_v,
+                                                              params.minimax_video_sigma_shift,
+                                                              params.minimax_audio_sigma_shift);
+                auto layout_for_reuse = build_layout(params.context->shape()[1],
+                                                     video_input_cache.shape()[2],
+                                                     video_input_cache.shape()[1],
+                                                     video_input_cache.shape()[0],
+                                                     params.minimax_audio_length,
+                                                     conditions,
+                                                     audio_conditions,
+                                                     params.minimax_keyframe_indices == nullptr ? empty_int : *params.minimax_keyframe_indices,
+                                                     reference_blocks,
+                                                     params.minimax_text_token_tags == nullptr ? empty_int : *params.minimax_text_token_tags,
+                                                     t_v,
+                                                     t_a);
+                position_input_cache = sd::Tensor<float>(
+                    {3, static_cast<int64_t>(layout_for_reuse.positions.size() / 3)},
+                    layout_for_reuse.positions);
+                if (config.uses_adaln_curves()) {
+                    std::vector<float> fractions(layout_for_reuse.timesteps.size());
+                    for (size_t i = 0; i < layout_for_reuse.timesteps.size(); ++i) {
+                        float position = std::clamp(layout_for_reuse.timesteps[i], 0.f, 1.f) * (config.adaln_curve_grid - 1);
+                        int index      = std::min(static_cast<int>(std::floor(position)),
+                                                  static_cast<int>(config.adaln_curve_grid - 2));
+                        fractions[i]   = position - index;
+                    }
+                    curve_fraction_input_cache = sd::Tensor<float>(
+                        {1, static_cast<int64_t>(fractions.size())},
+                        fractions);
+                } else {
+                    timestep_feature_input_cache = sd::Tensor<float>(
+                        {config.timestep_input_dim, static_cast<int64_t>(layout_for_reuse.timesteps.size())},
+                        timestep_embedding(layout_for_reuse.timesteps,
+                                           static_cast<int>(config.timestep_input_dim),
+                                           10000,
+                                           true,
+                                           1.f));
+                }
+                audio_slope_input_cache = sd::Tensor<float>(
+                    {1},
+                    {time_shift_slope(sigma_v,
+                                      params.minimax_video_sigma_shift,
+                                      params.minimax_audio_sigma_shift)});
+                std::vector<const sd::Tensor<float>*> ordered_inputs;
+                ordered_inputs.reserve(8 + conditions.size() + audio_conditions.size());
+                ordered_inputs.push_back(&video_input_cache);
+                ordered_inputs.push_back(&audio_input_cache);
+                ordered_inputs.push_back(params.context);
+                for (const auto& condition : conditions) {
+                    ordered_inputs.push_back(&condition);
+                }
+                for (const auto& condition : audio_conditions) {
+                    ordered_inputs.push_back(&condition);
+                }
+                ordered_inputs.push_back(&position_input_cache);
+                if (config.uses_adaln_curves()) {
+                    ordered_inputs.push_back(&curve_fraction_input_cache);
+                } else {
+                    ordered_inputs.push_back(&timestep_feature_input_cache);
+                }
+                ordered_inputs.push_back(&audio_slope_input_cache);
+                if (auto out = GGMLRunner::compute_reuse<float>(get_graph, ordered_inputs, n_threads, false)) {
+                    return restore_trailing_singleton_dims(std::move(*out), params.x->dim());
+                }
+            }
+            return restore_trailing_singleton_dims(GGMLRunner::compute<float>(get_graph,
+                                                                              n_threads,
+                                                                              false,
+                                                                              false),
+                                                   params.x->dim());
+        }
+    };
+
+}  // namespace MiniMaxH3
+
+#endif  // __ED_DIT_MODELS_MODELS_MINIMAX_H3_FULL_HPP__
