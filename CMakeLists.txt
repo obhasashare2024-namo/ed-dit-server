@@ -511,6 +511,27 @@ if(ED_BUILD_EXAMPLES)
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party
         )
         target_compile_features(test-w4a8-direct PRIVATE cxx_std_17)
+
+        add_executable(test-w4a4-direct examples/cli/test_w4a4_direct.cu)
+        target_link_libraries(test-w4a4-direct PRIVATE cublas cudart)
+        target_include_directories(test-w4a4-direct PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        )
+        target_compile_features(test-w4a4-direct PRIVATE cxx_std_17)
+
+        add_executable(bench-w4a4-int8-tensor-core examples/cli/bench_w4a4_int8_tensor_core.cu)
+        target_link_libraries(bench-w4a4-int8-tensor-core PRIVATE cublas cudart)
+        target_include_directories(bench-w4a4-int8-tensor-core PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        )
+        target_compile_features(bench-w4a4-int8-tensor-core PRIVATE cxx_std_17)
+
+        add_executable(w4a4-sm86-native examples/cli/w4a4_minimax_h3_sm86.cu)
+        target_link_libraries(w4a4-sm86-native PRIVATE cudart)
+        target_include_directories(w4a4-sm86-native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_features(w4a4-sm86-native PRIVATE cxx_std_17)
     endif()
 
     add_executable(ed-server
