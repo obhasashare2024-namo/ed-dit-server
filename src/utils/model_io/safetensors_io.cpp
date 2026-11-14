@@ -79,6 +79,8 @@ static ggml_type safetensors_dtype_to_ggml_type(const std::string& dtype) {
         ttype = GGML_TYPE_I32;
     } else if (dtype == "I64") {
         ttype = GGML_TYPE_I32;
+    } else if (dtype == "I8" || dtype == "U8" || dtype == "UI8") {
+        ttype = GGML_TYPE_I8;
     }
     return ttype;
 }
