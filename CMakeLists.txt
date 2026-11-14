@@ -503,6 +503,12 @@ if(ED_BUILD_EXAMPLES)
         set_property(TARGET ed-dit-server APPEND PROPERTY BUILD_RPATH ${ED_CUDNN_RUNTIME_LIBRARY_DIRS})
     endif()
 
+    if(ED_GGML_CUDA)
+        add_executable(test-w4a8-direct examples/cli/test_w4a8_direct.cu)
+        target_link_libraries(test-w4a8-direct PRIVATE cublas cudart)
+        target_compile_features(test-w4a8-direct PRIVATE cxx_std_17)
+    endif()
+
     add_executable(ed-server
         examples/server/main.cpp
         examples/server/routes.cpp

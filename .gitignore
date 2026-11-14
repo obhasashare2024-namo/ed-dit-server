@@ -1,0 +1,11 @@
+build/
+build-*/
+bin/
+*.log
+*.pt
+*.edlat
+*.edbin
+*.gguf
+.DS_Store
+.vscode/
+.idea/
